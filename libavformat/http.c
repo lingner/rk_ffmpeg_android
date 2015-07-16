@@ -293,6 +293,7 @@ static int http_open_cnx(URLContext *h)
     char path1[MAX_URL_SIZE];
     char buf[1024], urlbuf[MAX_URL_SIZE];
     int port, use_proxy, err, location_changed = 0, redirects = 0, attempts = 0;
+	int oldErrcode = h->errcode;
     HTTPAuthType cur_auth_type, cur_proxy_auth_type;
     HTTPContext *s = h->priv_data;
 
@@ -444,12 +445,12 @@ static int http_open_cnx(URLContext *h)
         http_set_persist_conn(h, s, hostname, port);
     return 0;
  fail:
-
+ 	
     av_log(h, AV_LOG_DEBUG, "http_open_cnx fail:code=%d,err = %d,ETIMEDOUT = %d",s->http_code,err,ETIMEDOUT);
     h->errcode = s->http_code;
     if(h->errcode != 0 && h->errcode > 0)
     {
-        if ((h->errcode == 403) || (h->errcode == 404))
+        if (((h->errcode == 403) || (h->errcode == 404))&&((oldErrcode!= 403) || (oldErrcode != 404)))
             ff_send_message(&h->interrupt_callback,MEDIA_INFO_DOWNLOAD_ERROR,h->errcode);
     }
 #if 0
@@ -994,6 +995,15 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
         s->off = off;
         av_log(NULL,AV_LOG_ERROR,"http_connect: This is http living stream ? off = %lld", s->off);
         return 0;
+    }
+    else if (s->http_code == 206 && off == 0 && s->off > 0 && strstr(path, "&zbytes="))
+    {
+        /* "&zbytes $from-$to" */
+        const char *p = strstr(path, "&zbytes=");
+        p += 8;
+        int64_t req_off = strtoll(p, NULL, 10);
+        av_log(NULL,AV_LOG_ERROR,"http_connect: zte stream, req_off = %lld, s->off = %lld", req_off, s->off);
+        return (req_off == s->off) ? 0 : -1;
     }
     else
 #endif
