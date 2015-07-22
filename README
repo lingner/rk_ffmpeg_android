@@ -32,5 +32,5 @@ FFmpeg README
   note:<venderid> is vender name : such as amlgic allwinner rockchip
   note:<chip_id>  is chip name : such as a20, s905,rk3368
 * MODIFIED frameworks/av/media/libmediaplayerservice/Android.mk : 
-	MODIFIED [BUILD_FF_PALYER := false] TO [BUILD_FF_PALYER := true]
+	MODIFIED [BUILD_FF_PLAYER := false] TO [BUILD_FF_PLAYER := true]
 * make your android sdk
