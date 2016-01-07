@@ -1084,8 +1084,10 @@ static int http_buf_read(URLContext *h, uint8_t *buf, int size)
         s->off += len;
         if (s->chunksize > 0)
             s->chunksize -= len;
+    /*} else if (len == 0 && s->filesize > 0 && s->off < s->filesize - 1) {
+        av_log(NULL, AV_LOG_ERROR, "http_buf_read, socket may be closed by server, retry: s->off(%lld), s->filesize(%lld)", s->off, s->filesize);
+        len = special_read(h,buf,size);*/
     }
-
 
     if(len <0 && s->mHlsConductor <= 0)
     {
@@ -1304,6 +1306,11 @@ static int64_t http_seek(URLContext *h, int64_t off, int whence)
         s->buf_end = s->buffer + old_buf_size;
         s->hd = old_hd;
         s->off = old_off;
+		if(s->http_code == 503)
+		{
+			s->off = 0;
+			return -503;
+		}
         s->filesize = old_filesize;// for fix asf seek
         return -1;
     }

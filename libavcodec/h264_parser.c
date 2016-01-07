@@ -251,8 +251,6 @@ static inline int parse_nal_units(AVCodecParserContext *s,
             ff_h264_decode_subset_seq_parameter_set(h);
             break;            
         case NAL_SPS:
-
-
 #if RECORD_SPS
             if ((h->sps_writefd != NULL) && (h->sps_writeok== 0)){
                 fwrite(buf,buf_size,1,h->sps_writefd);
@@ -262,87 +260,39 @@ static inline int parse_nal_units(AVCodecParserContext *s,
             }
 #endif
             ff_h264_decode_seq_parameter_set(h);
-            if(h->first == 0) {
-                for (i=0; i<buf_size; i++) {
-                    //加入了 00 00 01的判断，根据264的协议 sps pps的头和尾可以以这两种格式开头
-                    if ((buf[i] == 0x00) && (buf[i+1] == 0x00) && (buf[i+2] == 0x01)) {
-                        if (i > buf_size - 4) {
-                            times = 1;
-                        }
-                        if (((buf[i+3] & 0x1f) == 0x07) && (flag == 0)) {
-                            sps_off = i;
-                            flag = 1;
-                        } else if (((buf[i+3] & 0x1f) == 0x08)&&(flag == 1)) {
-                            pps_off = i;
-                            flag = 2;
-                            i+= 2;
-                        } else if (flag == 2){
-                            end_off = i;
-                            flag = 0;
-                            break;
-                        } 
-                    }else if ((buf[i] == 0x00) && (buf[i+1] == 0x00)
-                        && (buf[i+2] == 0x00) && (buf[i+3] == 0x01)) {
-                        if (i > buf_size - 5) {
-                            times = 1;
-                        }
-                        if (((buf[i+4] & 0x1f) == 0x07) && (flag == 0)) { 
-                            sps_off = i;
-                            flag = 1;
-                        } else if (((buf[i+4] & 0x1f) == 0x08)&&(flag == 1)) {
-                            pps_off = i;
-                            flag = 2;
-                            i+= 2;
-                        } else if (flag == 2){
-                            end_off = i;
-                            flag = 0;
-                            break;
-                        } 
-                    } 
-                }
-                flag = 0;
-                if ((pps_off == 0) && (sps_off == 0) && (times == 1)) {
-                    if ((buf[0] & 0x1f) == 0x07) {
-                            sps_off = 0;
-                            flag = 1;
-                    }
-                    for (i=0; i<buf_size; i++) {
-                        if (flag >= 1) {
-                            if ((buf[i] == 0x00) && (buf[i+1] == 0x00) && (buf[i+2] == 0x01)) {
-                                if (((buf[i+3] & 0x1f) == 0x08)&&(flag == 1)) {
-                                    pps_off = i;
-                                    flag = 2;
-                                    i+= 2; 
-                                } else if (flag == 2){
-                                    end_off = i;
-                                    flag = 0;
-                                    break;
-                                }
-                            } else if ((buf[i] == 0x00) && (buf[i+1] == 0x00)
-                                && (buf[i+2] == 0x00) && (buf[i+3] == 0x01)) {
-                                if (((buf[i+4] & 0x1f) == 0x08)&&(flag == 1)) {
-                                    pps_off = i;
-                                    flag = 2;
-                                    i+= 2;  //加2的目的是跳过000001这种情况下判断end_off异常
-                                } else if (flag == 2){
-                                    end_off = i;
-                                    flag = 0;
-                                    break;
-                                }
-                            } 
-                        } 
-                    }
-                }
 
+            if ((h->first == 0) && (buf_size > 350)) {
+                if ((buf[0] & 0x1f) == 0x07) {
+                        sps_off = 0;
+                        flag = 1;
+                }
+                if (flag >= 1) {
+                    for (i=10; i<300; i++) {
+                        if ((buf[i] == 0x01) && (buf[i-1] == 0x00) && (buf[i-2] == 0x00)) {
+                            if (((buf[i+1] & 0x1f) == 0x08)&&(flag == 1)) {
+                                if (buf[i-3] == 0x00)
+                                    pps_off = i-4;
+                                else
+                                    pps_off = i-3;
+                                flag = 2;
+                            } else if (flag == 2){
+                                if (buf[i-3] == 0x00)
+                                    end_off = i-4;
+                                else
+                                    end_off = i-3;
+                                flag = 0;
+                                break;
+                            }
+                        }
+                    }
+                }
                 sps_size = pps_off - sps_off;
                 pps_size = end_off - pps_off;
                 if ((sps_size <= 0) || ( pps_size <= 0)) {
                     goto sps_pps_err;
                 }
-                if (times == 1)
-                    sps_size += 4;
-
-                if ((sps_size > 100) || (pps_size > 50)) {
+                sps_size += 4;
+                if ((sps_size > 100) || (pps_size > 200)) {
                     av_log(NULL,AV_LOG_ERROR,"sps_size  or pps_size error return ");
                     goto sps_pps_err;
                 }
@@ -358,16 +308,12 @@ static inline int parse_nal_units(AVCodecParserContext *s,
 
                 memset(sps_buf, 0, sps_size);
                 memset(pps_buf, 0, pps_size);
-                    
-                if (times == 1) {
-                    sps_buf[0] = 0x00;
-                    sps_buf[1] = 0x00;
-                    sps_buf[2] = 0x00;
-                    sps_buf[3] = 0x01;
-                    memcpy(sps_buf+4, buf+sps_off, sps_size-4);
-                } else {
-                    memcpy(sps_buf, buf+sps_off, sps_size);
-                }
+
+                sps_buf[0] = 0x00;
+                sps_buf[1] = 0x00;
+                sps_buf[2] = 0x00;
+                sps_buf[3] = 0x01;
+                memcpy(sps_buf+4, buf+sps_off, sps_size-4);
                 memcpy(pps_buf, buf+pps_off, pps_size);
 
                 for (i=0; i<sps_size; i++)
@@ -377,7 +323,6 @@ static inline int parse_nal_units(AVCodecParserContext *s,
 
                 ff_codec_check_operate(&s->callback,OPERATE_GET_SPS,sps_buf,&sps_size);
                 ff_codec_check_operate(&s->callback,OPERATE_GET_PPS,pps_buf,&pps_size);
-                h->first = 1;
             }
 sps_pps_err:
             if(sps_buf != NULL)
@@ -391,12 +336,16 @@ sps_pps_err:
                 av_free(pps_buf);
                 pps_buf = NULL;
             }
+            h->first = 1;
             break;
         case NAL_PPS:
             ff_h264_decode_picture_parameter_set(h, h->s.gb.size_in_bits);
             break;
         case NAL_SEI:
             ff_h264_decode_sei(h);
+            if(strlen(h->usr_data) > 0){
+                ff_codec_check_operate(&s->callback,OPERATE_GET_SEI_USER_DATA,h->usr_data,NULL);
+            }
             break;
         case NAL_IDR_SLICE:
             s->key_frame = 1;
@@ -475,6 +424,19 @@ sps_pps_err:
                 s->repeat_pict = h->s.picture_structure == PICT_FRAME ? 1 : 0;
             }
 
+            if (avctx->width <= 0) {
+                int mb_width  = h->sps.mb_width;
+                int mb_height = h->sps.mb_height * (2 - h->sps.frame_mbs_only_flag);
+                int chroma_y_shift = h->sps.chroma_format_idc <= 1; // 400 uses yuv420p
+                int pic_width  = 16 * mb_width;
+                int pic_height = 16 * mb_height;
+
+                avcodec_set_dimensions(avctx, pic_width, pic_height);
+                avctx->width  -= (2>>CHROMA444)*FFMIN(h->sps.crop_right, (8<<CHROMA444)-1);
+                avctx->height -= (1<<chroma_y_shift)*FFMIN(h->sps.crop_bottom, (16>>chroma_y_shift)-1) * (2 - h->sps.frame_mbs_only_flag);
+                av_log(NULL, AV_LOG_ERROR, "%s parse avctx->width: %d", __FUNCTION__, avctx->width);
+            }
+            
             return 0; /* no need to evaluate the rest */
 
 		case NAL_AUD: // nothing need to be done.

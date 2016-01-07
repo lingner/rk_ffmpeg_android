@@ -508,6 +508,7 @@ static int parse_playlist(HLSContext *c, const char *url,
             av_log(NULL,AV_LOG_DEBUG,"%s:avio_open ok",__FUNCTION__,ret);
 #endif
 
+    memset(line, 0, sizeof(line));
     read_chomp_line(in, line, sizeof(line));
     if (strcmp(line, "#EXTM3U")) {
         ret = AVERROR_INVALIDDATA;
@@ -532,6 +533,8 @@ static int parse_playlist(HLSContext *c, const char *url,
 		{
 			break;
 		}
+        
+        memset(line, 0, sizeof(line));
         read_chomp_line(in, line, sizeof(line));
 //        av_log(NULL,AV_LOG_ERROR,"%s",line);
 
@@ -548,6 +551,9 @@ static int parse_playlist(HLSContext *c, const char *url,
                 free_segment_list(var);
                 var->finished = 0;
             }
+            
+            av_log(NULL, AV_LOG_ERROR, "read_chomp_line error, line: %s", line);
+            continue;
         }
         
         if (av_strstart(line, "#EXT-X-STREAM-INF:", &ptr)) {
@@ -710,6 +716,7 @@ static int parse_playlist(HLSContext *c, const char *url,
                     ret = AVERROR(ENOMEM);
                     goto fail;
                 }
+                memset(seg, 0, sizeof(struct segment));
                 seg->duration = duration;
                 seg->key_type = key_type;
 				seg->seek_operation_time = 0;  //add by xhr, for Bluray seek operation
@@ -998,12 +1005,36 @@ static int has_segment_discontinuity(struct variant *v)
     return 0;
 }
 
+static int usleep_cmcc_parse_list(HLSContext *c, int parse_list_retry)
+{
+    //for huawei sleep 1s、1s、1s、2s、5s、10s...
+    int sleepCnt = 0;
+    if (parse_list_retry < 4) {
+        sleepCnt = 2;//1s
+    } else if (parse_list_retry == 4) {
+        sleepCnt = 4;//2s
+    } else if (parse_list_retry == 5) {
+        sleepCnt = 4;//10;//5s  
+    } else {
+        sleepCnt = 4;//20;//10s
+    }
+    
+    while (sleepCnt > 0) {
+        if (ff_check_interrupt(c->interrupt_callback))
+            return AVERROR_EXIT;
+        sleepCnt --;
+        av_usleep(500*1000);
+    }
+    return 0;
+}
+
+
 static int read_data(void *opaque, uint8_t *buf, int buf_size)
 {
     struct variant *v = opaque;
     HLSContext *c = v->parent->priv_data;
-    int ret, i,retry = 0,parse_list_retry = 200,read_timeout_cnt = 0;
-    int64_t last_load_timeUs = av_gettime();
+    int ret, i,retry = 0,parse_list_retry = 0,read_timeout_cnt = 0;
+    int64_t last_open_timeUs = av_gettime();
     int sliceSmooth = 0;//Slice smooth handle  by fxw
     if(v->parent->exit_flag){
         return AVERROR_EOF;
@@ -1015,6 +1046,7 @@ restart:
         int64_t reload_interval = v->n_segments > 0 ?
                                   v->segments[v->n_segments - 1]->duration :
                                   v->target_duration;
+        
         c->seek_flags &= (~AVSEEK_FLAG_READ_NEED_OPEN_NEW_URL);                   
 #if HLS_DEBUG
         av_log(NULL, AV_LOG_DEBUG,"reload_interval = %"PRId64"\n",reload_interval);
@@ -1022,6 +1054,8 @@ restart:
 
         reload_interval *= 1000000;
         int expired_list = 0;
+        //for huawei
+        reload_interval -= 500000;
 reload:
         if(ff_check_operate(c->interrupt_callback,OPERATE_SEEK,NULL,NULL))
         {
@@ -1031,17 +1065,14 @@ reload:
         
         if (!v->finished &&
             av_gettime() - v->last_load_time >= reload_interval) {
+            
 #if HLS_DEBUG   
     av_log(NULL, AV_LOG_DEBUG,"%s:parse_playlist start:%s",__FUNCTION__,v->url);                   
 #endif            
             int64_t startTime = av_gettime();
             ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_START,-1); // c->interrupt_callback
             if ((ret = parse_playlist(c, v->url, v, NULL)) < 0){
-//                parse_list_retry--;
-                if(parse_list_retry < 0){
-                    av_log(NULL, AV_LOG_DEBUG,"parse_playlist return ret = %d",ret);
-                return ret;
-                }
+                parse_list_retry ++;
                 av_log(NULL, AV_LOG_DEBUG,"read_data():parse_playlist, ret = 0x%x",ret);
 				int errorcode = TIMEOUT;
 		        if(v != NULL)
@@ -1056,15 +1087,18 @@ reload:
                               }
 	                }
 	            }
-                ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_ERROR,errorcode);        
-                av_usleep(1000*1000);
+                
+                int uret = usleep_cmcc_parse_list(c, parse_list_retry);
+                if (uret == AVERROR_EXIT) {
+                    return uret;
+                }
+                ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_ERROR,errorcode);
+                
                 if(expired_list == 1){
-                    //free_segment_list(v);
-                    if (ff_check_interrupt(c->interrupt_callback))
-                        return AVERROR_EXIT;
-                    av_log(NULL,AV_LOG_DEBUG,"open_input time out, need retry parse list");
+                    av_log(NULL,AV_LOG_DEBUG,"open_input time out, need retry parse list %d", parse_list_retry);
                     goto reload;
                 }
+                
             }
             else
             {
@@ -1183,6 +1217,7 @@ reload:
         if (ret < 0){
             av_log(NULL, AV_LOG_DEBUG, "HLS read data %d\n",ret);
 			int errorcode = TIMEOUT;
+            int64_t expired_interval = 30;//30s
 	        if(v != NULL)
             {
                 URLContext *input = v->input;
@@ -1193,6 +1228,11 @@ reload:
                           errorcode = input->errcode;
                           av_log(NULL,AV_LOG_DEBUG,"read_data():open_input fail, errorcode = %d",errorcode);
                       }
+                } else if (ret >= -404 && ret <= -400) {
+                    errorcode = -ret;
+                    if (v->target_duration > 0)
+                        expired_interval = v->target_duration;
+                    av_log(NULL,AV_LOG_ERROR,"read_data: open_input fail, errorcode = %d",errorcode);
                 }
             }
             ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_ERROR,errorcode);
@@ -1207,13 +1247,19 @@ reload:
             }               
             av_log(NULL, AV_LOG_DEBUG,"read_data:open_input failed,reload");
 
-            int64_t expired_interval = 30;//30s
             expired_interval = (expired_interval<v->target_duration ? v->target_duration : expired_interval)+1;
             expired_interval *= 1000000;                            
-            if(!v->finished&&av_gettime() - last_load_timeUs >= expired_interval){
+            if ((!v->finished || errorcode == 404 || errorcode == 400) && av_gettime() - last_open_timeUs >= expired_interval){
                 ffurl_close(v->input);
                 v->input = NULL;
                 expired_list = 1;
+
+                if (errorcode == 404 || errorcode == 400) {
+                    v->cur_seq_no ++;
+                    c->end_of_segment = 1;
+                    c->cur_seq_no = v->cur_seq_no;
+                    av_log(NULL, AV_LOG_ERROR, "HLS read data skip current seq no %d, errorcode: %d", v->cur_seq_no, errorcode);
+                }
                 /*
                 av_log(NULL, AV_LOG_DEBUG, "HLS read data skip current seq no %d, open_interval %lld", v->cur_seq_no, open_interval);
                 v->cur_seq_no++;
@@ -1224,14 +1270,14 @@ reload:
                 ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_START,i);
                 ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_ERROR,TIMEOUT);*/
             }
-            av_usleep(200*1000);
+            av_usleep(1000*1000);
             goto reload;
             
         }
         expired_list = 0;
         c->read_seq_no = v->cur_seq_no;
     }
-    last_load_timeUs = av_gettime();
+    last_open_timeUs = av_gettime();
 	int temp = 1 + (v->n_segments > 0 ?
                                   v->segments[v->cur_seq_no- v->start_seq_no]->duration/2 :
                                   v->target_duration/2);   
@@ -1272,7 +1318,7 @@ reload:
         }
         if(ret == AVERROR_EOF){            
             v->filesize = ffurl_size(v->input);
-            v->last_load_time = av_gettime();
+            //v->last_load_time = av_gettime();//该语句会引发M3U8表更新不及时, by fxw
             av_log(NULL,AV_LOG_DEBUG, "read_data finished. ");
             break;
         }

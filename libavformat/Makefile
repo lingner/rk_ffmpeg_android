@@ -291,6 +291,8 @@ OBJS-$(CONFIG_RTP_MUXER)                 += rtp.o         \
                                             rtpenc_xiph.o \
                                             avc.o
 OBJS-$(CONFIG_RTPDEC)                    += rdt.o         \
+                                            rtpfec.o      \
+                                            rs_fec.o      \
                                             rtp.o         \
                                             rtpdec.o      \
                                             rtpdec_amr.o  \
@@ -309,15 +311,15 @@ OBJS-$(CONFIG_RTPDEC)                    += rdt.o         \
                                             rtpdec_svq3.o \
                                             rtpdec_vp8.o  \
                                             rtpdec_xiph.o
-OBJS-$(CONFIG_RTSP_DEMUXER)              += rtsp.o rtspdec.o httpauth.o \
+OBJS-$(CONFIG_RTSP_DEMUXER)              += rtpfec.o rs_fec.o rtsp.o rtspdec.o httpauth.o\
                                             urldecode.o
-OBJS-$(CONFIG_RTSP_MUXER)                += rtsp.o rtspenc.o httpauth.o \
+OBJS-$(CONFIG_RTSP_MUXER)                += rtpfec.o rs_fec.o rtsp.o rtspenc.o httpauth.o \
                                             rtpenc_chain.o urldecode.o
 OBJS-$(CONFIG_SAMI_DEMUXER)              += samidec.o
 OBJS-$(CONFIG_SAP_DEMUXER)               += sapdec.o
 OBJS-$(CONFIG_SAP_MUXER)                 += sapenc.o rtpenc_chain.o
 OBJS-$(CONFIG_SBG_DEMUXER)               += sbgdec.o
-OBJS-$(CONFIG_SDP_DEMUXER)               += rtsp.o
+OBJS-$(CONFIG_SDP_DEMUXER)               += rtpfec.o rs_fec.o rtsp.o
 OBJS-$(CONFIG_SEGAFILM_DEMUXER)          += segafilm.o
 OBJS-$(CONFIG_SEGMENT_MUXER)             += segment.o
 OBJS-$(CONFIG_SHORTEN_DEMUXER)           += rawdec.o
@@ -333,6 +335,7 @@ OBJS-$(CONFIG_SOX_MUXER)                 += soxenc.o
 OBJS-$(CONFIG_SPDIF_DEMUXER)             += spdif.o spdifdec.o
 OBJS-$(CONFIG_SPDIF_MUXER)               += spdif.o spdifenc.o
 OBJS-$(CONFIG_SRT_DEMUXER)               += srtdec.o
+OBJS-$(CONFIG_TEXT_DEMUXER)              += textdec.o
 OBJS-$(CONFIG_SRT_MUXER)                 += srtenc.o
 OBJS-$(CONFIG_STR_DEMUXER)               += psxstr.o
 OBJS-$(CONFIG_SUBVIEWER_DEMUXER)         += subviewerdec.o

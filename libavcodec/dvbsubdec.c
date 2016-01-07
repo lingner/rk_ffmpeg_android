@@ -29,6 +29,7 @@
 #define DVBSUB_CLUT_SEGMENT     0x12
 #define DVBSUB_OBJECT_SEGMENT   0x13
 #define DVBSUB_DISPLAYDEFINITION_SEGMENT 0x14
+#define DVBSUBS_DISPARITY_SIGNALLING_SEGMENT    0x15
 #define DVBSUB_DISPLAY_SEGMENT  0x80
 
 #define cm (ff_cropTbl + MAX_NEG_CROP)
@@ -380,6 +381,19 @@ static av_cold int dvbsub_init_decoder(AVCodecContext *avctx)
     }
 
     ctx->version = -1;
+
+    if (NULL == ctx->display_definition) {
+        ctx->display_definition = av_mallocz(sizeof(DVBSubDisplayDefinition));
+
+        /* configure for SD res in case DDS is not present */
+        ctx->display_definition->x = 0;
+        ctx->display_definition->y = 0;
+        ctx->display_definition->version = 0xff; /* an invalid version so it's always different */
+        ctx->display_definition->width = 720;
+        ctx->display_definition->height = 576;
+        avctx->width  = ctx->display_definition->width;
+        avctx->height = ctx->display_definition->height;
+    }
 
     default_clut.id = -1;
     default_clut.next = NULL;
@@ -1348,13 +1362,13 @@ static void dvbsub_parse_display_definition_segment(AVCodecContext *avctx,
         avctx->height = display_def->height;
     }
 
-    if (buf_size < 13)
-        return;
-
     if (info_byte & 1<<3) { // display_window_flag
+        if (buf_size < 13)
+            return;
+
         display_def->x = bytestream_get_be16(&buf);
-        display_def->y = bytestream_get_be16(&buf);
         display_def->width  = bytestream_get_be16(&buf) - display_def->x + 1;
+        display_def->y = bytestream_get_be16(&buf);
         display_def->height = bytestream_get_be16(&buf) - display_def->y + 1;
     }
 }

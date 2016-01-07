@@ -1211,7 +1211,7 @@ typedef struct AVFormatContext {
      * Remaining size available for raw_packet_buffer, in bytes.
      */
 //edit by xhr. init is 2.5M.
-#define RAW_PACKET_BUFFER_SIZE 500000
+#define RAW_PACKET_BUFFER_SIZE 2500000
     int raw_packet_buffer_remaining_size;
     int exit_flag;
     int mhlsdynamic;

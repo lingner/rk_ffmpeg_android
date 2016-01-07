@@ -266,4 +266,6 @@ static inline void *av_x_if_null(const void *p, const void *x)
 #define OPERATE_GET_SPS 3
 #define OPERATE_GET_PPS 4
 #define OPERATE_GET_PARAMETER_FAIL_VALUE 5
+#define OPERATE_GET_SEI_USER_DATA 6
+#define OPERATE_GET_MKV_GET_SEGMENT_INFO 7
 #endif /* AVUTIL_AVUTIL_H */

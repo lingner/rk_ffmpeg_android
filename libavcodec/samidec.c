@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012 Clément Bœsch
+ * Copyright (c) 2012 Clément B?sch
  *
  * This file is part of FFmpeg.
  *
@@ -34,6 +34,84 @@ typedef struct {
     AVBPrint full;
 } SAMIContext;
 
+//$_RKBOX_$_Martin_Modify for Special sami content line
+//<sync start=5820>The No.10 subtitile:  Oh,hold on.
+static int sami_paragraph_to_ass_lite(AVCodecContext *avctx, const char *src){
+    SAMIContext *sami = avctx->priv_data;
+    int ret = 0;
+    char *tag = NULL;
+    char *dupsrc = av_strdup(src);
+    char *p = dupsrc;
+    char *secp = dupsrc;
+
+    av_bprint_clear(&sami->content);
+    for (;;) {
+        char *saveptr = NULL;
+        int prev_chr_is_space = 0;
+        AVBPrint *dst = &sami->content;
+
+        /* parse & extract paragraph tag */
+        p = av_stristr(p, "<sync");
+        if (!p){
+            break;
+        }
+
+        if (dst->len) // add a separator with the previous paragraph if there was one
+            av_bprintf(dst, "\\N");
+        tag = av_strtok(p, ">", &saveptr);
+        if (!tag || !saveptr)
+            break;
+        p = saveptr;
+
+        /* check if the current paragraph is the "source" (speaker name) */
+        if (av_stristr(tag, "ID=Source") || av_stristr(tag, "ID=\"Source\"")) {
+            dst = &sami->source;
+            av_bprint_clear(dst);
+        }
+
+        /* if empty event -> skip subtitle */
+        while (isspace(*p))
+            p++;
+        if (!strncmp(p, "&nbsp;", 6)) {
+            ret = -1;
+            goto end;
+        }
+
+        /* extract the text, stripping most of the tags */
+        while (*p) {
+            if (*p == '<') {
+                if (!av_strncasecmp(p, "<P", 2) && (p[2] == '>' || isspace(p[2])))
+                    break;
+                if (!av_strncasecmp(p, "<BR", 3))
+                    av_bprintf(dst, "\\N");
+                p++;
+                while (*p && *p != '>')
+                    p++;
+                if (!*p)
+                    break;
+                if (*p == '>')
+                    p++;
+            }
+            if (!isspace(*p))
+                av_bprint_chars(dst, *p, 1);
+            else if (!prev_chr_is_space)
+                av_bprint_chars(dst, ' ', 1);
+            prev_chr_is_space = isspace(*p);
+            p++;
+        }
+    }
+
+    av_bprint_clear(&sami->full);
+    if (sami->source.len)
+        av_bprintf(&sami->full, "{\\i1}%s{\\i0}\\N", sami->source.str);
+    av_bprintf(&sami->full, "%s\r\n", sami->content.str);
+
+end:
+    av_free(dupsrc);
+    return ret;
+
+}
+
 static int sami_paragraph_to_ass(AVCodecContext *avctx, const char *src)
 {
     SAMIContext *sami = avctx->priv_data;
@@ -41,6 +119,13 @@ static int sami_paragraph_to_ass(AVCodecContext *avctx, const char *src)
     char *tag = NULL;
     char *dupsrc = av_strdup(src);
     char *p = dupsrc;
+    char *secp = dupsrc;
+
+    p = av_stristr(p, "<P");
+    if(NULL == p){
+        av_free(dupsrc);
+        return sami_paragraph_to_ass_lite(avctx, src);
+    }
 
     av_bprint_clear(&sami->content);
     for (;;) {
@@ -125,6 +210,7 @@ static int sami_decode_frame(AVCodecContext *avctx,
         ff_ass_add_rect(sub, sami->full.str, ts_start, ts_duration, 0);
     }
     *got_sub_ptr = sub->num_rects > 0;
+     
     return avpkt->size;
 }
 

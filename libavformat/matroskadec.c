@@ -949,6 +949,26 @@ static int ebml_parse_elem(MatroskaDemuxContext *matroska,
     default:
         if(ffio_limit(pb, length) != length)
             return AVERROR(EIO);
+    
+        /*add by hh for filter DIVX
+        * some information type = EBML_NONE in segments 
+        */
+        if(length > 0)
+        {
+            char* buffer = av_malloc(length+1);
+            if(buffer != NULL){
+                memset(buffer,0,length+1);
+                avio_read(pb,buffer,length);
+                ff_codec_check_operate(&matroska->ctx->interrupt_callback,OPERATE_GET_MKV_GET_SEGMENT_INFO,buffer,NULL);
+                #if 0
+                if(av_strstr(buffer,"divx") != NULL){
+                    av_dict_set(&matroska->ctx->metadata, "divx", "1", 0);
+                }
+                #endif
+                av_free(buffer);
+                return 0;
+            }
+        }
         return avio_skip(pb,length)<0 ? AVERROR(EIO) : 0;
     }
     if (res == AVERROR_INVALIDDATA)

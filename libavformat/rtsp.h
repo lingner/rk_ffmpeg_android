@@ -30,7 +30,9 @@
 
 #include "libavutil/log.h"
 #include "libavutil/opt.h"
+#include<pthread.h>
 
+#include "rs_fec.h"
 /**
  * Network layer over which RTP/etc packet data will be transported.
  */
@@ -204,6 +206,45 @@ enum RTSPServerType {
     RTSP_SERVER_WMS,  /**< Windows Media server */
     RTSP_SERVER_NB
 };
+
+#if 0
+enum Fec_type{
+	CTC = 0,// µçÐÅ
+	HUAWEI = 1,
+};
+#else
+#define CTC 0
+#define HUAWEI 1
+#endif
+
+typedef struct RTPCacheContext {
+    pthread_t tid;
+    int thread_status;
+    int working;
+    int fec_status;
+    int queue_len_av;
+    int queue_len_fec;
+    int type;
+
+    int64_t av_queue_datasize;
+    int64_t fec_queue_datasize;
+    RTPPacket *queue_av;
+    RTPPacket *queue_fec;
+    uint8_t * recv_buff;
+    
+    int fec_seq_start;
+    int fec_seq_end;
+    int fec_pkt_len;
+    int fec_pkt_num;
+
+    int last_delete_fec_seq_start;
+    int last_delete_fec_seq_end;
+
+    // data read/write Lock
+    pthread_mutex_t     mLock;
+
+    RSFecContext rs_fec_context;
+} RTPCacheContext;
 
 /**
  * Private data for the RTSP demuxer.
@@ -395,6 +436,8 @@ typedef struct RTSPState {
      * Whether or not rtcp
      */
     int rtcp_flag;
+
+    RTPCacheContext *rtp_cache_ctx;
 } RTSPState;
 
 #define RTSP_FLAG_FILTER_SRC  0x1    /**< Filter incoming UDP packets -
@@ -599,6 +642,9 @@ int ff_rtsp_getnameinfo(const struct sockaddr *sa, int salen,
  * Open RTSP transport context.
  */
 int ff_rtsp_open_transport_ctx(AVFormatContext *s, RTSPStream *rtsp_st);
+int ff_rtsp_fec_core_process(AVFormatContext *s);
+int rtp_udp_print_packet(RTPDemuxContext *s, const char *buf);
+void* rtp_cache_thread(void *fctx);
 
 extern const AVOption ff_rtsp_options[];
 

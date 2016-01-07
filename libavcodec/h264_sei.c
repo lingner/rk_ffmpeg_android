@@ -153,7 +153,8 @@ static int decode_unregistered_user_data(H264Context *h, int size){
 
     if(s->avctx->debug & FF_DEBUG_BUGS)
         av_log(s->avctx, AV_LOG_DEBUG, "user data:\"%s\"\n", user_data+16);
-
+    memset(h->usr_data,0,256);
+    memcpy(h->usr_data,&user_data[16],256);
     for(; i<size; i++)
         skip_bits(&s->gb, 8);
 

@@ -2237,10 +2237,27 @@ const char *avcodec_license(void)
 
 void avcodec_flush_buffers(AVCodecContext *avctx)
 {
+    /*  
+    * add for hh
+    * 使用不包含杜比的ffmpeg库，源码输出时播放杜比片源，
+    * 由于avctx->codec为空，会导致seek flush时ffmpeg奔溃
+    */
+    if((avctx == NULL) || (avctx->codec == NULL))
+    {
+        av_log(NULL, AV_LOG_ERROR, "avcodec_flush_buffers:codec = NULL");
+        return ;
+    }
+    
     if (HAVE_THREADS && avctx->active_thread_type & FF_THREAD_FRAME)
+    {
+        av_log(NULL, AV_LOG_ERROR, "avcodec_flush_buffers: ff_thread_flush");
         ff_thread_flush(avctx);
+    }
     else if (avctx->codec->flush)
-        avctx->codec->flush(avctx);
+    {
+        av_log(NULL, AV_LOG_ERROR, "avcodec_flush_buffers: flush");
+       avctx->codec->flush(avctx);
+    }
 
     avctx->pts_correction_last_pts =
     avctx->pts_correction_last_dts = INT64_MIN;

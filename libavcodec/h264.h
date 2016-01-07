@@ -749,6 +749,8 @@ typedef struct H264Context {
     int force_sps;
 
     int first;
+
+    char usr_data[256];
 } H264Context;
 
 extern const uint8_t ff_h264_chroma_qp[7][QP_MAX_NUM + 1]; ///< One chroma qp table for each possible bit depth (8-14).

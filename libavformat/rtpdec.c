@@ -32,6 +32,8 @@
 #include "rtpdec.h"
 #include "rtpdec_formats.h"
 
+#include "rtpfec.h"
+
 //#define DEBUG
 
 /* TODO: - add RTCP statistics reporting (should be optional).
@@ -105,6 +107,9 @@ void av_register_rtp_dynamic_payload_handlers(void)
     ff_register_dynamic_payload_handler(&ff_g726_24_dynamic_handler);
     ff_register_dynamic_payload_handler(&ff_g726_32_dynamic_handler);
     ff_register_dynamic_payload_handler(&ff_g726_40_dynamic_handler);
+
+    /*RFC5510 Reed-Solomon Forward Error Correction (FEC) ->RTP Parser Handler*/
+    ff_register_dynamic_payload_handler(&ff_rsfec_dynamic_handler);
 }
 
 RTPDynamicProtocolHandler *ff_rtp_handler_find_by_name(const char *name,
@@ -527,7 +532,7 @@ static int rtp_parse_packet_internal(RTPDemuxContext *s, AVPacket *pkt,
         buf += ext;
     }
 
-    if (!st) {
+    if (!st && (s->payload_type != FEC_PLAYLOAD)) {
         /* specific MPEG2TS demux support */
         ret = ff_mpegts_parse_packet(s->ts, pkt, buf, len);
         /* The only error that can be returned from ff_mpegts_parse_packet
@@ -616,8 +621,13 @@ static void enqueue_packet(RTPDemuxContext *s, uint8_t *buf, int len)
     /* Find the correct place in the queue to insert the packet */
     while (cur) {
         int16_t diff = seq - cur->seq;
-        if (diff < 0)
-            break;
+        if (diff < 0){
+	     if(diff < -1000){
+		   // rtp seq revert,insert to back
+	     }else{
+	           break;
+	     }
+        }
         prev = cur;
         cur = cur->next;
     }
@@ -717,13 +727,21 @@ static int rtp_parse_one_packet(RTPDemuxContext *s, AVPacket *pkt,
         return rtcp_parse_packet(s, buf, len);
     }
 
+    if(s->payload_type == FEC_PLAYLOAD){
+        s->seq = AV_RB16(buf + 2);;
+        rtp_parse_packet_internal(s, pkt, buf, len);
+        enqueue_packet(s, buf, len);
+        *bufptr = NULL;
+        return 0;
+    }
+
     if ((s->seq == 0 && !s->queue) || s->queue_size <= 1) {
         /* First packet, or no reordering */
         return rtp_parse_packet_internal(s, pkt, buf, len);
     } else {
         uint16_t seq = AV_RB16(buf + 2);
         int16_t diff = seq - s->seq;
-        if (diff < 0) {
+        if (diff <= 0) {
             /* Packet older than the previously emitted one, drop */
             av_log(s->st ? s->st->codec : NULL, AV_LOG_WARNING,
                    "RTP: dropping old packet received too late\n");

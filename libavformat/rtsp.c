@@ -49,6 +49,10 @@
 #include "rtpenc.h"
 #include "mpegts.h"
 
+#include <pthread.h>
+#include "rtpfec.h"
+#include "rs_fec.h"
+
 //#define DEBUG
 
 /* Timeout values for socket poll, in ms,
@@ -57,7 +61,7 @@
 #define READ_PACKET_TIMEOUT_S 10
 #define MAX_TIMEOUTS READ_PACKET_TIMEOUT_S * 1000 / POLL_TIMEOUT_MS
 #define SDP_MAX_SIZE 16384
-#define RECVBUF_SIZE 10 * RTP_MAX_PACKET_LENGTH
+#define RECVBUF_SIZE RTP_MAX_PACKET_LENGTH
 #define DEFAULT_REORDERING_DELAY 100000
 
 #define OFFSET(x) offsetof(RTSPState, x)
@@ -652,6 +656,13 @@ void ff_rtsp_close_streams(AVFormatContext *s)
             av_free(rtsp_st);
         }
     }
+
+    if(rt->rtp_cache_ctx != NULL){
+	 fec_close(rt->rtp_cache_ctx);
+	 av_free(rt->rtp_cache_ctx);
+	 rt->rtp_cache_ctx = NULL;
+    }
+	
     av_free(rt->rtsp_streams);
     if (rt->asf_ctx) {
         avformat_close_input(&rt->asf_ctx);
@@ -1857,6 +1868,337 @@ static int udp_read_packet(AVFormatContext *s, RTSPStream **prtsp_st,
     }
 }
 
+/*
+* fec恢复av包的处理
+*/
+int ff_rtsp_fec_core_process(AVFormatContext *s){
+    RTSPState *rt = s->priv_data;
+    int ii = 0;
+    int fec_lost_map[256]={0};
+    uint8_t **buffer_fec = NULL;
+    uint8_t **buffer_rtp = NULL;
+    int av_count = 0;
+    int start = 0,end = 0;
+
+    if((NULL == rt->rtp_cache_ctx)||(NULL == rt->rtp_cache_ctx->queue_fec)){
+        return -1;
+    }
+    
+    RTPPacket * pkt = rt->rtp_cache_ctx->queue_fec;
+    fec_update_range(s, pkt->fec_rtp_start, pkt->fec_rtp_end, pkt->fec_pkt_num, pkt->fec_pkt_len);
+    //malloc two-dimensional array
+    buffer_fec = rtp_get_fec_vector(rt, fec_lost_map);
+    buffer_rtp =  rtp_get_av_vector(rt, fec_lost_map);
+
+    //fec core process
+    RSFecContext *ctx =  av_malloc(sizeof(RSFecContext));
+    start = rt->rtp_cache_ctx->fec_seq_start;
+    end = rt->rtp_cache_ctx->fec_seq_end;
+    if(end > start){
+        av_count = end -start + 1;
+    }else{
+        // av包序列号反转的情况
+        // ...,65534,65535,0,1,2,...
+        av_count = 65535-start+end+2;
+    }
+
+    fec_init(ctx,av_count, rt->rtp_cache_ctx->fec_pkt_num, rt->rtp_cache_ctx->fec_pkt_len);
+    // fec RS算法
+    int rv = fec_decode(ctx, buffer_rtp, buffer_fec, fec_lost_map);
+    fec_cleanup(ctx);
+    av_free(ctx); 
+    ctx = NULL;
+   
+    //release two-dimensional array
+     if(buffer_rtp != NULL){
+       av_free(buffer_rtp);
+    }
+	 
+    if(buffer_fec != NULL){
+    	av_free(buffer_fec);
+    }
+}
+
+/*
+* 读取经过fec处理的av包数据
+*/
+static int ff_rtsp_read_from_cache(AVFormatContext *s, RTSPStream **prtsp_st,
+                           uint8_t **buf, int buf_size, int64_t wait_end){
+    RTSPState *rt = s->priv_data;
+    RTPCacheContext *cache_ctx = rt->rtp_cache_ctx;
+    *prtsp_st = NULL;
+    int readEnable = 0;
+    int start = -1;
+    int end = -1;
+    int64_t rv_time = 0; 
+    const int64_t MAX_TIME = 100000;
+    int fec_count = 0;
+    int av_count = 0;
+    int count = 0;
+    int fec_rtp_num = 0; 
+
+   RTPPacket* av_queue = cache_ctx->queue_av;
+   RTPPacket* fec_queue = cache_ctx->queue_fec;
+   
+   if(fec_queue != NULL){
+   	start	 = fec_queue->fec_rtp_start;
+       end	 = fec_queue->fec_rtp_end;
+	rv_time = fec_queue->recvtime;
+	fec_rtp_num = fec_queue->fec_pkt_num;
+   }
+
+   if(av_queue != NULL){
+   	int av_start = av_queue->seq;
+	#if 0
+      /*
+       * 防止缓冲的数据过多，过多是直接读走
+      *  防止服务器一直不发送fec包的情况
+      */
+	if(cache_ctx->queue_len_av >= 5000){
+	     av_log(NULL, AV_LOG_ERROR,"%s,cache too much data , read direct",__FUNCTION__);
+	     readEnable = 1; 
+	}
+	#endif
+	
+//	av_log(NULL, AV_LOG_ERROR,"%s,av_start = %d,start = %d, end = %d,cache_ctx->last_delete_fec_seq = %d,fec_rtp_num = %d",__FUNCTION__,av_start,start,end,cache_ctx->last_delete_fec_seq_end,fec_rtp_num);
+	/*
+	* 如果fec的fec_rtp_start大于当前音视频包rtp的序列号，那么
+	* 当前音视频包是已经经过fec处理过或者网络慢后续才来的
+	* 音视频包，直接读走,无需等待
+	*/
+	if(start > av_start){
+	    readEnable = 1; 
+	}else if((av_start >= start && av_start <= end) || ((start > end) && ((av_start >=start || (av_start <= end))))){
+	    /*
+	    * av_start >= start && av_start <= end : 当前av包在当前fec的fec_rtp_start和fec_rtp_end之间
+	    * ((start > end) && ((av_start >=start || (av_start <= end)))): fec包序列反正，并且av包在
+	    * fec_rtp_start和fec_rtp_end之间
+	    */
+	    int fec_rev_complete = 0;
+	    int av_rev_complete = 0;
+	    pthread_mutex_lock(&(cache_ctx->mLock));
+	    /* 
+	    *  查看是否是已经处理过的过时的fec包，如果是过时的包直接删掉。
+	    * 可能存在这种情况，fec某个rtp包丢失后填充全0数据送入RS处理
+	    * 恢复av包后，处理后的fec数据被删除队列，此时如果再收到那个
+	    * 已丢失的fec包，会插入fec队列头部，造成问题
+	    *
+	    */
+	    if((fec_queue->fec_rtp_start == cache_ctx->last_delete_fec_seq_start) && (cache_ctx->last_delete_fec_seq_start = fec_queue->fec_rtp_start)){
+		 av_free(fec_queue->buf);
+	        av_free(fec_queue); 
+
+	        cache_ctx->queue_len_fec--;
+	        fec_count --;
+		 pthread_mutex_unlock(&(cache_ctx->mLock));
+		 return AVERROR(EAGAIN);
+	    }
+	    /*
+	    * 统计处理当前av的fec个数
+	    */
+	    while(fec_queue != NULL){
+		 RTPPacket* next = fec_queue->next;
+		 if((fec_queue->fec_rtp_start == start) && (fec_queue->fec_rtp_end == end))
+	 	 {
+	 	     fec_count ++;	
+		     if(fec_queue->recvtime > rv_time){
+		         rv_time = fec_queue->recvtime;
+		     }
+		     fec_queue = next;
+	 	}
+		else{
+		 	break;
+		 }
+	    }
+           pthread_mutex_unlock(&(cache_ctx->mLock));
+	    fec_queue = cache_ctx->queue_fec;
+           /*
+           * 如果已经收齐fec包，或者接收当前fec包的时间大于规定时间，则认为
+           * fec包丢失，不再等待
+           */
+	    if((fec_count == fec_queue->fec_pkt_num) || ((av_gettime() - rv_time) > MAX_TIME)){
+		 // fec complete
+		 fec_rev_complete = 1;
+	    }else{
+	        *prtsp_st = NULL;
+               return AVERROR(EAGAIN);
+	    }
+
+	    rv_time = 0;
+	    pthread_mutex_lock(&(cache_ctx->mLock));
+	    /*
+           * 如果已经fec包控制的av包收齐，或者接收当前av(在当前fec控制的范围内)的时间大于
+           * 设定时间，则认为av包丢失，不再等待
+           */
+    	    while(av_queue != NULL){
+		RTPPacket* next = av_queue->next;
+		if((av_queue->seq >= start && av_queue->seq <= end) || 
+			((start > end) && ((av_queue->seq  >=start || (av_queue->seq  <= end))))){
+		    av_count++;
+		    if(av_queue->recvtime > rv_time){
+		           rv_time = av_queue->recvtime;
+		    }
+		    av_queue = next;
+		}else{
+		     break;
+		}
+           }
+	    pthread_mutex_unlock(&(cache_ctx->mLock));
+           count = end - start+1;
+	    /*
+	    * 注意序列号反转，av 序列从..,65535- 0,1,2
+	    */
+           if(start > end){
+		  count = 65535-start+end+2;
+           }
+	    if((av_count == count) ||((av_gettime() - rv_time) > MAX_TIME)){
+	        av_rev_complete = 1;
+	    }else{
+	        *prtsp_st = NULL;
+               return AVERROR(EAGAIN);
+	    }
+           
+	    if((av_rev_complete == 1) && (fec_rev_complete == 1)){
+		 /*
+		 * fec RS算法只能恢复小于fec数量的丢包，如果丢包数量
+		 * 大于fec包的数目，则不再进行RS包恢复，否则会导致
+		 * RS库奔溃，即使库不奔溃也无法恢复丢失的av包
+		 */
+		 if((count - av_count) <= fec_rtp_num){
+                   ff_rtsp_fec_core_process(s);
+		     // fec decode av packet 
+                   av_log(NULL, AV_LOG_ERROR,"%s AV_REV_COMPLETE: fec and av complete,decode av,start = %d,end = %d,count = %d",__FUNCTION__,start,end,av_count);
+		 }
+		 // delete fec
+		    pthread_mutex_lock(&(cache_ctx->mLock));
+	           fec_queue = cache_ctx->queue_fec;
+		    fec_count = fec_queue->fec_pkt_num;
+	            while (fec_queue  != NULL){
+	                RTPPacket* next = fec_queue->next;
+			  cache_ctx->last_delete_fec_seq_end = fec_queue->fec_rtp_end;
+			  cache_ctx->last_delete_fec_seq_start = fec_queue->fec_rtp_start;
+			  cache_ctx->fec_queue_datasize -= fec_queue->len;
+
+			  av_log(NULL, AV_LOG_ERROR, "%s  delete FEC Packet seq = %d,start  = %d,end = %d", __FUNCTION__,fec_queue->seq,cache_ctx->last_delete_fec_seq_end,cache_ctx->last_delete_fec_seq_start);
+			//  av_log(NULL, AV_LOG_ERROR, "%s  delete fec_queue = %p,fec_queue->buf  = %p", __FUNCTION__,fec_queue,fec_queue->buf);
+	                av_free(fec_queue->buf);
+	                av_free(fec_queue);        
+
+	                cache_ctx->queue_len_fec--;
+			  fec_count --;
+			  fec_queue  = next;
+                       if(next != NULL){
+				if((next->fec_rtp_start != cache_ctx->last_delete_fec_seq_start) ||
+					(next->fec_rtp_end != cache_ctx->last_delete_fec_seq_end)){
+					break;
+				}
+                       }
+				
+	                
+	            }
+		     av_log(NULL, AV_LOG_ERROR, "%s after delete FEC Packet, left fec queue_len_fec  = %d", __FUNCTION__,cache_ctx->queue_len_fec);
+                   cache_ctx->queue_fec = fec_queue;
+		     pthread_mutex_unlock(&(cache_ctx->mLock));
+
+		     readEnable = 1;
+	    }
+	}
+	else if(((cache_ctx->last_delete_fec_seq_end >= av_start) && (cache_ctx->last_delete_fec_seq_start <= av_start)) ||
+		    ((cache_ctx->last_delete_fec_seq_end <= cache_ctx->last_delete_fec_seq_start)
+		    		&& ((av_start >= cache_ctx->last_delete_fec_seq_start) || (av_start <= cache_ctx->last_delete_fec_seq_end)))){
+		/*
+		* 当前av包是fec已经处理过的包，直接读走，注意fec包的序列转
+		*/
+	       readEnable = 1;
+		av_log(NULL, AV_LOG_ERROR, "%s  FEC Packet,already decoder,read direct,av_start = %d,last_delete_fec_seq = %d", __FUNCTION__,av_start,cache_ctx->last_delete_fec_seq_end);
+   	}
+   }
+   else{
+   }
+
+    if(readEnable == 1){
+	    RTSPStream *stream = rt->rtsp_streams[0];
+	    *prtsp_st = stream;	
+	    pthread_mutex_lock(&(cache_ctx->mLock));
+	    RTPPacket *header = cache_ctx->queue_av;
+	    if(NULL != header){
+	        int len = 0;
+		 int seq = header->seq;
+
+		 /*
+		 * 释放ff_rtsp_fetch_packet申请的rt->recvbuf
+		 */
+	        if(NULL != *buf){
+	            av_free(*buf);
+	        }
+
+               /*
+               * 如果是插入的空包恢复出来的音视频数据，rtp包头的序列需要强行
+               * 修改，因为fec不对rtp头进行恢复，如果这边不强行修改，会导致rtp
+               * 头解析时，解析到的数据包序列为一个之前用过的序列号(或者是随机值，
+               * 具体情况不详)，导致rtp解析时将该数据包丢掉
+               */
+               if(header->insert){
+		        buf[2] = (0xff00&seq)>>8;
+			 buf[3] = (0xff&seq);
+               }
+	        *buf = header->buf;
+	        len  = header->len;
+	        RTPPacket *next = header->next;
+
+	        cache_ctx->queue_av = next;
+	        cache_ctx->queue_len_av--;
+		 cache_ctx->av_queue_datasize -= len;
+		 pthread_mutex_unlock(&(cache_ctx->mLock));
+
+		 av_free(header);
+		 header = NULL;
+	        return len;
+    	}else{
+    	      pthread_mutex_unlock(&(cache_ctx->mLock));
+    	}
+    }
+    
+    return AVERROR(EAGAIN);
+    
+}
+
+void* rtp_cache_thread(void *fctx){
+    AVFormatContext *fc = fctx;
+    RTSPState *rt = fc->priv_data;
+    RTPCacheContext *cache_ctx = rt->rtp_cache_ctx;
+    cache_ctx->working=1;
+    do{
+        if (ff_check_interrupt(&fc->interrupt_callback)){
+            cache_ctx->working = 0;
+	     av_log(NULL, AV_LOG_ERROR, "%s -->ff_check_interrupt", __FUNCTION__);
+            break;
+        }
+
+        /*malloc new rtp packet buffer*/
+        if (!cache_ctx->recv_buff) {
+            cache_ctx->recv_buff = av_mallocz(RECVBUF_SIZE);
+            if (!cache_ctx->recv_buff){
+                cache_ctx->working = 0;
+		  av_log(NULL, AV_LOG_ERROR, "%s -->malloc cache_ctx->recv_buff fail", __FUNCTION__);
+                continue;
+            }
+        }
+
+        RTSPStream *rtsp_st = NULL;
+        int64_t wait_end = 0;//DEFAULT_REORDERING_DELAY;
+        int rtp_seq = 0;
+        int len = udp_read_packet(fc, &rtsp_st, cache_ctx->recv_buff, RECVBUF_SIZE, wait_end);        
+        if((len>0)&&(NULL!=rtsp_st)){
+            RTPDemuxContext *rtpctx = rtsp_st->transport_priv;
+            rtp_cache_enqueue(rt, rtpctx, cache_ctx->recv_buff, len);
+            cache_ctx->recv_buff = NULL;
+        }
+    }while(cache_ctx->working==1);
+   av_log(NULL, AV_LOG_ERROR, "%s -->rtp_cache_thread end", __FUNCTION__);
+    return ;
+}
+
 int ff_rtsp_fetch_packet(AVFormatContext *s, AVPacket *pkt)
 {
     RTSPState *rt = s->priv_data;
@@ -1931,7 +2273,11 @@ redo:
 #endif
     case RTSP_LOWER_TRANSPORT_UDP:
     case RTSP_LOWER_TRANSPORT_UDP_MULTICAST:
-        len = udp_read_packet(s, &rtsp_st, rt->recvbuf, RECVBUF_SIZE, wait_end);
+        if(NULL != rt->rtp_cache_ctx){
+            len = ff_rtsp_read_from_cache(s, &rtsp_st, &rt->recvbuf, RECVBUF_SIZE, wait_end); // &insert_data
+        }else{
+            len = udp_read_packet(s, &rtsp_st, rt->recvbuf, RECVBUF_SIZE, wait_end);
+        }
 
         if (len > 0 && rtsp_st->transport_priv && rt->transport == RTSP_TRANSPORT_RTP)
             ff_rtp_check_and_send_back_rr(rtsp_st->transport_priv, len);
@@ -2227,6 +2573,61 @@ static int rtp_read_header(AVFormatContext *s)
     rt->media_type_mask = (1 << (AVMEDIA_TYPE_DATA+1)) - 1;
 
     ret = sdp_read_header(s);
+    
+    /*
+    * 四川移动fec功能
+    * 打开fec端口
+    * 中兴平台网址: rtp://192.168.0.28:5004?ChannelFECPort=5005
+    *                                  fec端口号由?ChannelFECPort=指定
+    * 华为平台网址: rtp://192.168.0.28:5004
+    *                                  fec端口号默认为音视频端口号减1
+    * fec为Forward Error Correction(前向纠错)的缩写，用于使用
+    * 收到的fec包来恢复传输过程中丢掉的音视频rtp包
+    */
+
+    // 暂时只对中兴平台做处理
+    if(strstr(s->filename,"?ChannelFECPort=") != NULL)
+    {
+        RTSPStream* rtsp_fec = NULL;
+        /*解析url,获取fec的ip和端口号*/
+        if(fec_parse_url(s,&rtsp_fec) == 0)
+        {
+            //Even static payload types may need a custom depacketizer
+            //Registering Dynamic Protocol Handler(ff_rsfec_dynamic_handler) for FEC 
+            RTPDynamicProtocolHandler *handler = ff_rtp_handler_find_by_id(
+                                      rtsp_fec->sdp_payload_type, AVMEDIA_TYPE_ATTACHMENT);
+            init_rtp_handler(handler, rtsp_fec, NULL);
+            if (handler && handler->init){
+                handler->init(s, rtsp_fec->stream_index,rtsp_fec->dynamic_protocol_context);
+            }
+
+            /*fec连接*/
+            fec_connect(s,rtsp_fec);
+
+           /*初始化fec结构体*/
+	     if(init_fec(&(rt->rtp_cache_ctx)) == 1){
+		   if(strstr(s->filename,"?ChannelFECPort=") != NULL){
+		   	rt->rtp_cache_ctx->type = CTC;
+		   }else{
+		       rt->rtp_cache_ctx->type = HUAWEI;
+                   #if 0
+			if(open_fec_lib(rt->rtp_cache_ctx)){
+			    init_fec_lib(rt->rtp_cache_ctx);
+		       }
+                    #endif
+		   } 
+
+               /*
+               * 创建读取数据的线程
+               * 通过fec恢复音视频包数据时，会比较耗时(100-200多ms)
+               * 耗时的操作如果跟udp读取数据的线程一起时，有可能
+               * 导致从udp端口读取数据不及时而造成大量的数据丢失
+               */
+	         rt->rtp_cache_ctx->thread_status = pthread_create(&rt->rtp_cache_ctx->tid, NULL, &rtp_cache_thread, s);
+	     }
+        }
+    }
+
     s->pb = NULL;
     return ret;
 

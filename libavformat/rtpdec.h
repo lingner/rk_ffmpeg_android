@@ -134,6 +134,14 @@ typedef struct RTPPacket {
     uint8_t *buf;
     int len;
     int64_t recvtime;
+
+    int   fec_rtp_start;
+    int   fec_rtp_end;
+    int   fec_pkt_num;
+    int   fec_pkt_idx;
+    int   fec_pkt_len;
+
+    int   insert;
     struct RTPPacket *next;
 } RTPPacket;
 

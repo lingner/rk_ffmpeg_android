@@ -2254,6 +2254,7 @@ static int64_t mpegts_get_dts(AVFormatContext *s, int stream_index,
 {
     MpegTSContext *ts = s->priv_data;
     int64_t pos;
+    int64_t inpos = *ppos;
     pos = ((*ppos  + ts->raw_packet_size - 1 - ts->pos47) / ts->raw_packet_size) * ts->raw_packet_size + ts->pos47;
     ff_read_frame_flush(s);
     if (avio_seek(s->pb, pos, SEEK_SET) < 0)
@@ -2270,7 +2271,29 @@ static int64_t mpegts_get_dts(AVFormatContext *s, int stream_index,
             ff_reduce_index(s, pkt.stream_index);
             av_add_index_entry(s->streams[pkt.stream_index], pkt.pos, pkt.dts, 0, 0, AVINDEX_KEYFRAME /* FIXME keyframe? */);
             if(pkt.stream_index == stream_index){
-                *ppos= pkt.pos;
+		  /*
+		* pkt.pos保存的是当前pes包在整个文件中的位置减去ts->raw_packet_size
+		* 从pos开始读取数据，当pos位置后的第一个47正好为pes包的开头时
+		* 当前位置-ts->raw_packet_size(大小为188/192/204)有可能会比pos小，从而
+		* 导致ff_gen_search中获取到的pos_limit大于pos_max，ff_gen_search函数中的assert(pos_limit <= pos_max);
+		* 会导致seek时ffmpeg库奔溃掉
+		*/
+		 #if 0 // ffmpeg原始代码
+		 {
+	               *ppos= pkt.pos;
+		 }		   
+		 #else // modify by hh
+		 {
+			  if(pkt.pos < inpos)
+			  {
+			  	*ppos= pkt.pos + ts->raw_packet_size-ts->pos47;
+			  }
+			  else
+			  {
+	                     *ppos= pkt.pos;
+			  }
+		 }
+		 #endif		
                 return pkt.dts;
             }
         }
