@@ -50,7 +50,14 @@
 #undef NDEBUG
 #include <assert.h>
 
-#define FCC_SWITCH_ENABLE 0
+#include "url.h"
+
+#define FAST_IPTV_SWITCH_LEVEL      0x07 //define 0 means close fast switch mode
+#define FAST_OTT_SWITCH_LEVEL       0x05
+#define FAST_S_DEC_FRAME            0x01 // don't decode_frame
+#define FAST_S_FRAME_RATE           0x02 // don't cal frame_rate
+#define FAST_S_CHK_PIXFMT           0x04 // don't check pixel format
+
 
 /**
  * @file
@@ -385,6 +392,25 @@ static int set_codec_from_probe_data(AVFormatContext *s, AVStream *st, AVProbeDa
     }
     return score;
 }
+
+static int check_fast_switch(AVFormatContext *ic, AVCodecContext *c, int level){
+    int switchLevel = FAST_OTT_SWITCH_LEVEL;
+    if (ic->mIPTVControlProbe == 1 || ic->mIPTVControlProbe == 2) {
+        switchLevel = FAST_IPTV_SWITCH_LEVEL;
+    }
+    
+    if ((switchLevel & level) == 0) {
+        return 0;
+    }
+    
+    if (c && c->codec_id == AV_CODEC_ID_H264 && c->codec_type == AVMEDIA_TYPE_VIDEO
+        /*&& (ic->mIPTVControlProbe == 1 || ic->mIPTVControlProbe == 2)*/) {
+        return 1;
+    }
+    
+    return 0;
+}
+
 
 /************************************************************/
 /* input media file */
@@ -1451,6 +1477,8 @@ static int has_codec_parameters(AVStream *st, const char **errmsg_ptr)
             FAIL("no decodable DTS frames");
         break;
     case AVMEDIA_TYPE_VIDEO:
+        if (avctx->codec_id == AV_CODEC_ID_HEVC)
+            break;
         if (!avctx->width)
             FAIL("unspecified size");
         if (st->info->found_decoder >= 0 && avctx->pix_fmt == AV_PIX_FMT_NONE)
@@ -1636,7 +1664,7 @@ int av_read_frame(AVFormatContext *s, AVPacket *pkt)
 return_packet:
 
     st = s->streams[pkt->stream_index];
-	if((s->mIPTVControlProbe == 1) && !has_codec_parameters(st, NULL) && FCC_SWITCH_ENABLE)
+	if((s->mIPTVControlProbe == 1) && st->codec && st->codec->codec_type == AVMEDIA_TYPE_AUDIO && !has_codec_parameters(st, NULL))
 	{
 		av_log(NULL, AV_LOG_ERROR, ".......found_decoder = %d", st->info->found_decoder);
 		try_decode_frame(st, pkt, NULL, 1);
@@ -2273,6 +2301,7 @@ static void update_stream_timings(AVFormatContext *ic)
     duration = INT64_MIN;
     for(i = 0;i < ic->nb_streams; i++) {
         st = ic->streams[i];
+        av_log(ic, AV_LOG_ERROR, "update_stream_timings: st[%d].duration = %lld",st->duration);
         if (st->start_time != AV_NOPTS_VALUE && st->time_base.den) {
             start_time1= av_rescale_q(st->start_time, st->time_base, AV_TIME_BASE_Q);
             if (st->codec->codec_type == AVMEDIA_TYPE_SUBTITLE || st->codec->codec_type == AVMEDIA_TYPE_DATA) {
@@ -2378,20 +2407,700 @@ static void estimate_timings_from_bit_rate(AVFormatContext *ic)
 #define DURATION_MAX_READ_SIZE 250000
 #define DURATION_MAX_RETRY 4
 
-/* only usable for MPEG-PS streams */
-static void estimate_timings_from_pts(AVFormatContext *ic, int64_t old_offset)
+typedef struct RK_STREAM_INFO{
+    /*
+    * 开始时间和结束时间，用于计算 duration
+    *  pts:       2 100  101  102 * * * * * * 1000  2000
+    *                   |                                   |
+    *              start_pts                         end_pts
+    */
+    int64_t start_pts;
+    int64_t end_pts;
+
+    /*
+    * 保存上一帧的时间戳
+    */
+    int64_t last_pts;
+
+ //   int64_t current_pts;
+
+    /*
+    * 突变的第一个pts
+    */
+    int64_t change_pts;
+
+    int64_t duration;
+    /*
+    * 当前统计的个数
+    */
+    int     total_check_num;
+
+    /*
+    *时间戳改变后连续检测的个数
+    */
+    int     change_check_num;
+
+    int     change_valid_num;
+
+    int     change;
+}RK_STREAM_INFO;
+
+
+/*
+* 用于扫描整个ts文件，分段检测音视频时间戳是否有翻转
+*如果有反转，则分段计算duration. 
+*分段的起始和结束时间戳如果正常，则会忽略分段内部，
+*否则则对分段内部时间戳进行统计
+*
+*扫描时分段的大小会影响 统计的精度。
+*本函数只能对时间戳规律变化的文件进行处理
+*/
+static void scan_all_file_estimate_timings(AVFormatContext *ic, int64_t old_offset)
 {
     AVPacket pkt1, *pkt = &pkt1;
+    AVStream *st;
+    int read_size, i, ret;
+    int64_t end_time;
+    int64_t filesize, offset, duration,duration1;
+    int retry=0;
+    int64_t ret_seek = -1;
+    int64_t start_time = 0;
+    int64_t max_diff = 10*1000*1000;
+    int64_t stepSize = 10*1024*1024;
+    int64_t diff = 0;
+    int64_t backStep = 0;
+    int check_frame_num = 5;
+    int contuneFind = 0;
+    RK_STREAM_INFO *currentInfo = NULL;
+    RK_STREAM_INFO *otherInfo = NULL;
+    RK_STREAM_INFO *info = av_mallocz(sizeof(RK_STREAM_INFO)*ic->nb_streams);
+    if(info == NULL){
+        return ;
+    }
+    /* flush packet queue */
+    flush_packet_queue(ic);
+    av_log(NULL,AV_LOG_ERROR,"%s",__FUNCTION__); 
+    for (i=0; i<ic->nb_streams; i++) {
+        st = ic->streams[i];
+        if (st->start_time == AV_NOPTS_VALUE && st->first_dts == AV_NOPTS_VALUE)
+            av_log(st->codec, AV_LOG_WARNING, "start time is not set in estimate_timings_from_pts\n");
+
+        if (st->parser) {
+            av_parser_close(st->parser);
+            st->parser= NULL;
+        }
+
+        if(info != NULL)
+        {
+            info[i].start_pts = st->start_time;
+            if((info[i].start_pts == AV_NOPTS_VALUE) && (st->first_dts == AV_NOPTS_VALUE))
+                info[i].start_pts = st->first_dts;
+
+            
+            info[i].last_pts = info[i].start_pts;
+            info[i].end_pts = info[i].last_pts;
+            info[i].duration = 0;
+            info[i].change = 0;
+        }
+    }
+
+    /* estimate the end time (duration) */
+    /* XXX: may need to support wrapping */
+    filesize = ic->pb ? avio_size(ic->pb) : 0;
+    end_time = AV_NOPTS_VALUE;
+    offset = 0;
+    do{
+        if (offset < 0)
+            offset = 0;
+
+        if(offset >= filesize)
+        {
+            break;
+        }
+
+        for (i=0; i<ic->nb_streams; i++)
+        {
+            info[i].total_check_num = 0;
+            info[i].change_check_num = 0;
+            info[i].change_valid_num = 0;
+        }
+
+        if (ff_check_interrupt(&(ic->interrupt_callback)))
+        {
+            if(info != NULL){
+                av_free(info);
+                info = NULL;
+            }
+            return AVERROR_EXIT;
+        }
+        ret_seek = avio_seek(ic->pb, offset, SEEK_SET);
+        
+  //      av_log(NULL,AV_LOG_ERROR,"000 seek offset=%lld,ret_seek = %d,filesize = %lld",offset,ret_seek,filesize); 
+        for(;;) {
+            do {
+                if (ff_check_interrupt(&(ic->interrupt_callback)))
+                {
+                    if(info != NULL){
+                        av_free(info);
+                        info = NULL;
+                    }
+                    return AVERROR_EXIT;
+                }
+                ret = ff_read_packet(ic, pkt);
+            } while(ret == AVERROR(EAGAIN));
+            
+            if (ret != 0)
+                break;
+
+
+            st = ic->streams[pkt->stream_index];
+            if(st->codec != NULL && ((st->codec->codec_type == AVMEDIA_TYPE_SUBTITLE)
+                    || (st->codec->codec_type == AVMEDIA_TYPE_DATA))){
+                av_free_packet(pkt);
+                continue;
+            }
+            
+            currentInfo = &info[pkt->stream_index];
+
+            if(pkt->pts != AV_NOPTS_VALUE)
+            {
+                if(currentInfo->start_pts == AV_NOPTS_VALUE)
+                {
+                    currentInfo->start_pts = pkt->pts;
+                }
+                
+                if(currentInfo->last_pts == AV_NOPTS_VALUE)
+                {
+                    currentInfo->last_pts = pkt->pts;
+                }
+
+                if(currentInfo->end_pts == AV_NOPTS_VALUE)
+                {
+                    currentInfo->end_pts = pkt->pts;
+                }
+                
+                currentInfo->total_check_num ++;
+                diff = pkt->pts - currentInfo->last_pts;
+                
+           //     av_log(NULL,AV_LOG_ERROR,"index = %d,pts = %lld,last_pts = %lld,total_check_num = %d,diff =%lld",pkt->stream_index,pkt->pts,currentInfo->last_pts,currentInfo->total_check_num,diff);
+                /*
+                * 当前帧时间有跳变,对于短时间内反复的跳变无法处理
+                */
+                if(diff > max_diff || diff < -max_diff){
+          //         av_log(NULL,AV_LOG_ERROR,"1111111 pkt->pts = %lld,currentInfo->last_pts = %lld",pkt->pts,currentInfo->last_pts);
+                    /*
+                    * 该片段第一个切片就与上个片段的时间戳相距很大
+                    */
+                    currentInfo->change_pts = pkt->pts;
+                    currentInfo->last_pts = pkt->pts;
+                    currentInfo->change = 1;
+                    /*
+                    *   重置统计计算，查看随后的check_frame_num帧是否也有突变
+                    */
+                    currentInfo->change_check_num = 1;
+                    currentInfo->change_valid_num = 1;
+                }
+                else
+                {
+             //       av_log(NULL,AV_LOG_ERROR,"currentInfo->change = %d",currentInfo->change);
+                    if(currentInfo->change == 0)
+                    {
+                        if(currentInfo->total_check_num >= check_frame_num)
+                        {
+                            currentInfo->total_check_num = 0;
+                            currentInfo->change_check_num = 0;
+                            currentInfo->change_valid_num = 0;
+                            currentInfo->end_pts = pkt->pts;
+                            currentInfo->last_pts = pkt->pts;
+
+                            otherInfo = NULL;
+                            for (i=0; i<ic->nb_streams; i++)
+                            {
+                                if(i != pkt->stream_index)
+                                {
+                                    otherInfo = &info[i];
+                                    if(otherInfo->change == 1)
+                                    {
+                     //                   av_log(NULL,AV_LOG_ERROR,"kkkkkk i = %d otherInfo->change_check_num = %d",i,otherInfo->change_check_num);
+
+                                        /*
+                                        * 如果其他stream发生了时间戳变化，但是检测次数没有达到
+                                        * 则继续在当前位置检测
+                                        */
+                                        if(otherInfo->change_check_num < check_frame_num)
+                                        {
+                                            contuneFind = 1;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        otherInfo->total_check_num = 0;
+                                        otherInfo->change_check_num = 0;
+                                        otherInfo->change_valid_num = 0;
+                                        otherInfo->end_pts = pkt->pts;
+                                        otherInfo->last_pts = pkt->pts;
+                                    }
+                                }
+                            }
+                            
+                            if(contuneFind == 1)
+                            {
+                                contuneFind = 0;
+                                continue;
+                            }
+                            
+                            diff = filesize - avio_tell(ic->pb);
+                            if(diff > stepSize)
+                            {
+                                offset = avio_tell(ic->pb) + stepSize;
+                            }
+                            else if((diff <= stepSize) && (diff > stepSize/2))
+                            {
+                                offset = avio_tell(ic->pb) + stepSize/2;
+                            }
+                            else if(diff > DURATION_MAX_READ_SIZE)
+                            {
+                                offset = avio_tell(ic->pb) + DURATION_MAX_READ_SIZE;
+                            }
+                            else
+                            {
+                                offset = filesize;
+                            }
+                            retry = 0;
+                            av_free_packet(pkt);
+                            break;
+                        }
+                        else
+                        {
+                            currentInfo->last_pts = pkt->pts;
+                        }
+                    }
+                    else
+                    {
+                        // 是否是从当前片段的第一帧时间戳就突变
+                  //      av_log(NULL,AV_LOG_ERROR,"222222 total_check_num = %d,change_check_num = %d,change_valid_num = %d",
+                  //              currentInfo->total_check_num,currentInfo->change_check_num,currentInfo->change_valid_num);
+                        if(currentInfo->total_check_num == currentInfo->change_check_num)
+                        {
+                            // 第一帧时间戳就开始突变,并且已连续检测check_frame_num次
+                            if(currentInfo->change_valid_num >= check_frame_num)
+                            {
+                                currentInfo->change_check_num = 0;
+                                currentInfo->total_check_num = 0;
+                                currentInfo->change_valid_num = 0;
+                                retry ++;
+                                backStep = stepSize/(2*retry);
+                                // 回跳再次检测
+                    //            av_log(NULL,AV_LOG_ERROR,"555555 retry = %d,backStep = %lld",retry,backStep);
+                                offset -= backStep;
+                    //            av_log(NULL,AV_LOG_ERROR,"333333 offset = %lld",offset);
+                                av_free_packet(pkt);
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            if((currentInfo->change_valid_num >= check_frame_num) || 
+                                    (currentInfo->change_check_num - currentInfo->change_valid_num >= check_frame_num))
+                            {                                
+                                currentInfo->change = 0;
+                                
+                                currentInfo->duration += (currentInfo->end_pts - currentInfo->start_pts);
+                 //               av_log(NULL,AV_LOG_ERROR,"777777 duration[%d] = %lld,end_pts = %lld,start_pts = %lld",pkt->stream_index,currentInfo->duration,currentInfo->end_pts,currentInfo->start_pts);
+
+                                currentInfo->start_pts = currentInfo->change_pts;
+                                currentInfo->end_pts = currentInfo->last_pts;
+
+                                currentInfo->change_check_num = 0;
+                                currentInfo->change_valid_num = 0;
+                                retry = 0;
+                                for (i=0; i<ic->nb_streams; i++)
+                                {
+                                    if(i != pkt->stream_index)
+                                    {
+                                        currentInfo = &info[i];
+                                        if(currentInfo->change == 1)
+                                        {
+                                            currentInfo->duration += (currentInfo->end_pts - currentInfo->start_pts);
+                                            currentInfo->change = 0;
+                                            currentInfo->start_pts = currentInfo->change_pts;
+                                      //      currentInfo->last_pts = currentInfo->current_pts;
+                                            currentInfo->end_pts = currentInfo->last_pts;
+                                            currentInfo->change_check_num = 0;
+                                            currentInfo->change_valid_num = 0;
+                                            retry = 0;
+                                            
+                     //           av_log(NULL,AV_LOG_ERROR,"777777 duration[%d] = %lld,end_pts = %lld,start_pts = %lld",i,currentInfo->duration,currentInfo->end_pts,currentInfo->start_pts);
+                                        }
+                                    }
+                                }
+
+                                diff = filesize - avio_tell(ic->pb);
+                                if(diff > stepSize)
+                                {
+                                    offset = avio_tell(ic->pb) + stepSize;
+                                }
+                                else if((diff <= stepSize) && (diff > stepSize/2))
+                                {
+                                    offset = avio_tell(ic->pb) + stepSize/2;
+                                }
+                                else if(diff > DURATION_MAX_READ_SIZE)
+                                {
+                                    offset = avio_tell(ic->pb) + DURATION_MAX_READ_SIZE;
+                                }
+                                else
+                                {
+                                    offset = filesize;
+                                }
+                                av_free_packet(pkt);
+                                break;
+                            }
+                            else
+                            {
+                                diff = pkt->pts - currentInfo->last_pts;//currentInfo->last_pts;
+
+                                /*
+                                * 判断pts突变后，后续的时间戳是否正常
+                                */
+                                if(diff < max_diff || diff > -max_diff)
+                                {
+                                    currentInfo->change_valid_num ++;
+                                    currentInfo->last_pts = pkt->pts;
+                                    diff = pkt->pts - currentInfo->change_pts;
+                                    if(diff > max_diff || diff < -max_diff)
+                                    {
+                                        currentInfo->change_pts = pkt->pts;
+                           //             av_log(NULL,AV_LOG_ERROR,"888888 change change pts = %lld",currentInfo->change_pts);
+                                    }
+                                }
+
+                                currentInfo->change_check_num ++;
+                                
+                          //      av_log(NULL,AV_LOG_ERROR,"888888 %d diff = %lld,change_check_num = %d,change_valid_num = %d",pkt->stream_index,diff,currentInfo->change_check_num,currentInfo->change_valid_num);
+                            }
+                        }
+                    }
+                }
+            }
+
+            av_free_packet(pkt);
+        }
+    }while(!url_feof(ic->pb));
+    
+    for (i=0; i<ic->nb_streams; i++)
+    {
+        st = ic->streams[i];
+        currentInfo = &info[i];
+        st->duration = currentInfo->duration;
+        if(currentInfo->end_pts != AV_NOPTS_VALUE && currentInfo->start_pts != AV_NOPTS_VALUE &&
+                currentInfo->end_pts > currentInfo->start_pts)
+        {
+            st->duration += currentInfo->end_pts - currentInfo->start_pts;
+        }
+        
+     //   av_log(NULL,AV_LOG_ERROR,"st[%d].duration = %lld,currentInfo->duration = %lld",i,st->duration,currentInfo->duration);
+     //   av_log(NULL,AV_LOG_ERROR,"end_pts = %lld,start_pts = %lld",currentInfo->end_pts,currentInfo->start_pts);
+    }
+
+    /*
+       * st->start_time may be is error time in stream,for example: 10000,0,1,2,3.
+       * start_time is 10000, it will be used in function update_stream_timings
+       * (called by fill_all_stream_timings) to caculate duration,
+       * so we don't call fill_all_stream_timings. We just get the max value in all stream
+       */
+ //   fill_all_stream_timings(ic);
+
+    // get max duration value 
+    duration = 0;
+    for(i = 0;i < ic->nb_streams; i++) {
+        st = ic->streams[i];
+        if (st->duration != AV_NOPTS_VALUE) {
+            duration1 = av_rescale_q(st->duration, st->time_base, AV_TIME_BASE_Q);
+            duration = FFMAX(duration, duration1);
+
+     //       av_log(ic, AV_LOG_ERROR, "scan_all_file_estimate_timings: duration = %lld", duration);
+        }
+    }
+
+    if (duration != INT64_MIN && duration > 0) {
+        ic->duration = duration;
+        
+        av_log(ic, AV_LOG_ERROR, "scan_all_file_estimate_timings: ic->duration = %lld", ic->duration);
+    }
+    
+    if (ic->pb && (filesize = avio_size(ic->pb)) > 0 && ic->duration != AV_NOPTS_VALUE) {
+        /* compute the bitrate */
+        ic->bit_rate = (double)filesize * 8.0 * AV_TIME_BASE /
+            (double)ic->duration;
+    }
+
+    // 代码来自fill_all_stream_timings
+    for(i = 0;i < ic->nb_streams; i++) {
+        st = ic->streams[i];
+        if (st->start_time == AV_NOPTS_VALUE) {
+            if(ic->start_time != AV_NOPTS_VALUE)
+                st->start_time = av_rescale_q(ic->start_time, AV_TIME_BASE_Q, st->time_base);
+            if(ic->duration != AV_NOPTS_VALUE)
+                st->duration = av_rescale_q(ic->duration, AV_TIME_BASE_Q, st->time_base);
+        }
+    }
+    
+
+    ret_seek = avio_seek(ic->pb, old_offset, SEEK_SET);
+    while (ret_seek < 0 && old_offset == 0) {                   
+        if (ff_check_interrupt(&(ic->interrupt_callback))) {
+            av_log(NULL,AV_LOG_DEBUG,"%s:interrupt ok",__FUNCTION__);
+            if(info != NULL){
+                av_free(info);
+                info = NULL;
+            }
+            return AVERROR_EXIT;
+        }
+        av_usleep(100000);
+        av_log(NULL, AV_LOG_ERROR, "%s failed, try again", __FUNCTION__, ret_seek);
+        ret_seek = avio_seek(ic->pb, old_offset, SEEK_SET);
+    }
+    
+    for (i=0; i<ic->nb_streams; i++) {
+        st= ic->streams[i];
+        st->cur_dts= st->first_dts;
+        st->last_IP_pts = AV_NOPTS_VALUE;
+        st->reference_dts = AV_NOPTS_VALUE;
+    }
+    
+    if(info != NULL){
+        av_free(info);
+        info = NULL;
+    }
+}
+
+/*
+* 二分法查找节目的时常
+* 该方法适用于片源的后半段数据为非ts有效数据
+*(找不到0x47的同步头)的问题片源
+*/
+static int binary_estimate_timings_from_pts(AVFormatContext *ic, int64_t old_offset)
+{
+	av_log(NULL, AV_LOG_ERROR,"===============binary_estimate_timings_from_pts");
+	AVPacket pkt1, *pkt = &pkt1;
     AVStream *st;
     int read_size, i, ret;
     int64_t end_time;
     int64_t filesize, offset, duration;
     int retry=0;
     int64_t ret_seek = -1;
+	int64_t start_offset =0;
+	filesize = ic->pb ? avio_size(ic->pb) : 0;
 
+    int have_valid_data = 1;
+    int64_t curentPos = 0;
+    URLProtocol *h = NULL;
+
+    RK_STREAM_INFO *currentInfo = NULL;
+    RK_STREAM_INFO *info = av_mallocz(sizeof(RK_STREAM_INFO)*ic->nb_streams);
+    if(info == NULL){
+        return 0;
+    }
+    /*
+    * 二分查找开始和结束的位置
+    */
+    int64_t start_postion = 0;
+    int64_t end_postion = 0;
+    int64_t temp_position = 0;
     /* flush packet queue */
     flush_packet_queue(ic);
 
+    for (i=0; i<ic->nb_streams; i++) {
+        st = ic->streams[i];
+        if (st->start_time == AV_NOPTS_VALUE && st->first_dts == AV_NOPTS_VALUE)
+            av_log(st->codec, AV_LOG_WARNING, "start time is not set in estimate_timings_from_pts\n");
+
+        if (st->parser) {
+            av_parser_close(st->parser);
+            st->parser= NULL;
+        }
+    }
+
+    /* estimate the end time (duration) */
+    /* XXX: may need to support wrapping */
+  //  filesize = ic->pb ? avio_size(ic->pb) : 0;
+
+    end_postion = filesize;
+	offset = (end_postion - start_postion)/2;
+    do{
+        end_time = AV_NOPTS_VALUE;
+        //offset = filesize - (DURATION_MAX_READ_SIZE<<retry);
+        av_log(NULL,AV_LOG_ERROR,"+++++++++ offset is %lld",  offset);
+        if (ff_check_interrupt(&(ic->interrupt_callback)))
+        {
+            av_log(NULL,AV_LOG_DEBUG,"%s:interrupt ok",__FUNCTION__);
+            return AVERROR_EXIT;
+        }
+        
+        if (offset < 0)
+            offset = 0;
+
+        for (i=0; i<ic->nb_streams; i++) {
+            info[i].total_check_num = 0;
+        }
+        
+        ret_seek = avio_seek(ic->pb, offset, SEEK_SET);
+		if(ret_seek == -503)
+		{
+			return;
+		}
+        while(ret_seek < 0)
+        {                   
+            if (ff_check_interrupt(&(ic->interrupt_callback)))
+            {
+                av_log(NULL,AV_LOG_DEBUG,"%s:interrupt ok",__FUNCTION__);
+                return AVERROR_EXIT;
+            }
+            av_usleep(100000);
+            ret_seek = avio_seek(ic->pb, offset, SEEK_SET);
+        }
+        
+        have_valid_data = 1;
+        for(;;) {
+			int64_t startPos = avio_tell(ic->pb);
+            do {
+                if (ff_check_interrupt(&(ic->interrupt_callback)))
+                {
+                    av_log(NULL,AV_LOG_DEBUG,"%s:interrupt ok",__FUNCTION__);
+                    return AVERROR_EXIT;
+                }
+                ret = ff_read_packet(ic, pkt);
+				curentPos =  avio_tell(ic->pb);
+
+                /*
+                * 防止进入无效数据段时，读取过多的无效数据
+                */
+				if ((curentPos - startPos) > DURATION_MAX_READ_SIZE*2){
+                    have_valid_data = 0;
+          //          av_log(NULL,AV_LOG_ERROR,"curentPos = %lld,startPos = %lld",curentPos,startPos); 
+    				break;
+			    }
+            } while(ret == AVERROR(EAGAIN));
+
+            /*
+            * 从(curentPos - startPos) > DURATION_MAX_READ_SIZE*2 条件跳出
+            * 表示当前端没有可用的数据，设置seek位置
+            */
+            if(have_valid_data == 0)
+            {
+                have_valid_data = 1;
+                av_log(NULL,AV_LOG_ERROR,"have no valid data"); 
+                break;
+            }
+            
+            if (ret != 0)
+                break;
+
+            currentInfo = &info[pkt->stream_index];
+            read_size += pkt->size;
+            st = ic->streams[pkt->stream_index];
+       //     av_log(NULL,AV_LOG_ERROR,"stream_index=%d,pkt->pts = %lld",pkt->stream_index,pkt->pts);  
+            if (pkt->pts != AV_NOPTS_VALUE &&
+                (st->start_time != AV_NOPTS_VALUE ||
+                 st->first_dts  != AV_NOPTS_VALUE)) {
+                duration = end_time = pkt->pts;
+                if (st->start_time != AV_NOPTS_VALUE)
+                {
+                    if(duration > st->start_time) // ht for some pts err at end of file
+                    {
+                        duration -= st->start_time;
+                    }
+                    else
+                    {
+                        // 时间戳有反转,只对本地文件这样处理
+                        if((ic->pb != NULL) && (ic->pb->opaque != NULL))
+                        {
+                            h = ((URLContext*)ic->pb->opaque)->prot;
+                            if((h != NULL) && (h->name != NULL))
+                            {
+                                if(av_strcasecmp(h->name,"file") == 0)
+                                {
+                                    av_free_packet(pkt);
+                                    if(info != NULL)
+                                    {
+                                        av_free(info);
+                                        info = NULL;
+                                    }
+                                    return -1;
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                    duration -= st->first_dts;
+                if (duration < 0)
+                    duration += 1LL<<st->pts_wrap_bits;
+
+                currentInfo->total_check_num ++;
+                
+                if (duration > 0) {
+                    if (st->duration == AV_NOPTS_VALUE || st->duration < duration){
+                        st->duration = duration;
+                    //    av_log(NULL,AV_LOG_ERROR,"st[%d].duration = %lld",pkt->stream_index,st->duration);
+                    }
+                }
+
+                if(currentInfo->total_check_num > 3)
+                {
+                    break;
+                }
+            }
+            av_free_packet(pkt);
+
+          //  if(currentInfo->
+        }
+		// if cannot find sync bite
+        if(end_time == AV_NOPTS_VALUE)
+        {	
+            av_log(NULL,AV_LOG_ERROR,"seek Before");
+            end_postion = offset;
+        }
+		else
+        {
+            av_log(NULL,AV_LOG_ERROR,"seek after");
+            start_postion = offset;
+	    }
+
+        
+        offset = start_postion+(end_postion - start_postion)/2;
+        
+        av_log(NULL,AV_LOG_ERROR,"start_postion = %lld,end_postion = %lld,offset = %lld",
+		    start_postion,end_postion,offset);
+		
+    }while((end_postion - start_postion) > DURATION_MAX_READ_SIZE || (curentPos < end_postion));
+
+    if(info != NULL)
+    {
+        av_free(info);
+        info = NULL;
+    }
+    
+    av_log(NULL, AV_LOG_ERROR, "binary_estimate_timings_from_pts out");
+    return 0;
+}
+
+
+/* only usable for MPEG-PS streams */
+static int estimate_timings_from_pts(AVFormatContext *ic, int64_t old_offset)
+{
+    AVPacket pkt1, *pkt = &pkt1;
+    AVStream *st;
+    int read_size, i, ret = 0;
+    int64_t end_time;
+    int64_t filesize, offset, duration;
+    int retry=0;
+    int64_t ret_seek = -1;
+    URLProtocol *h = NULL;
+
+    /* flush packet queue */
+    flush_packet_queue(ic);
+    av_log(NULL, AV_LOG_ERROR,"estimate_timings_from_pts");
     for (i=0; i<ic->nb_streams; i++) {
         st = ic->streams[i];
         if (st->start_time == AV_NOPTS_VALUE && st->first_dts == AV_NOPTS_VALUE)
@@ -2436,8 +3145,11 @@ static void estimate_timings_from_pts(AVFormatContext *ic, int64_t old_offset)
             do {
                 ret = ff_read_packet(ic, pkt);
             } while(ret == AVERROR(EAGAIN));
-            if (ret != 0)
+            if (ret != 0){
                 break;
+            }
+
+            av_log(NULL,AV_LOG_DEBUG,"%s::pkt->stream_index = %d",__FUNCTION__,pkt->stream_index);
             read_size += pkt->size;
             st = ic->streams[pkt->stream_index];
             if (pkt->pts != AV_NOPTS_VALUE &&
@@ -2446,9 +3158,26 @@ static void estimate_timings_from_pts(AVFormatContext *ic, int64_t old_offset)
                 duration = end_time = pkt->pts;
                 if (st->start_time != AV_NOPTS_VALUE)
                 {
-                    if(duration > st->start_time) // ht for some pts err at end of file
+                    if(duration >= st->start_time) // ht for some pts err at end of file
                     {
                         duration -= st->start_time;
+                    }
+                    else
+                    {
+                        // 时间戳有反转,只对本地文件这样处理
+                        if((ic->pb != NULL) && (ic->pb->opaque != NULL))
+                        {
+                            h = ((URLContext*)ic->pb->opaque)->prot;
+                            if((h != NULL) && (h->name != NULL))
+                            {
+                                if(av_strcasecmp(h->name,"file") == 0)
+                                {
+                                    av_free_packet(pkt);
+                                    return -1;
+                                }
+                            }
+                        }
+                        
                     }
                 }
                 else
@@ -2465,7 +3194,25 @@ static void estimate_timings_from_pts(AVFormatContext *ic, int64_t old_offset)
     }while(   end_time==AV_NOPTS_VALUE
            && filesize > (DURATION_MAX_READ_SIZE<<retry)
            && ++retry <= DURATION_MAX_RETRY);
-
+    
+    av_log(NULL, AV_LOG_ERROR, "%s end_time = %lld,AV_NOPTS_VALUE = %lld", __FUNCTION__, end_time,AV_NOPTS_VALUE);
+    if(end_time==AV_NOPTS_VALUE)
+    {
+        /*
+        * 只有本地文件才二分查找
+        */
+        if((ic->pb != NULL) && (ic->pb->opaque != NULL))
+        {
+            h = ((URLContext*)ic->pb->opaque)->prot;
+            if((h != NULL) && (h->name != NULL))
+            {
+                if(av_strcasecmp(h->name,"file") == 0)
+                {
+                    ret = binary_estimate_timings_from_pts(ic,old_offset);
+                }
+            }
+        }
+    }
 
     fill_all_stream_timings(ic);
 
@@ -2486,11 +3233,15 @@ static void estimate_timings_from_pts(AVFormatContext *ic, int64_t old_offset)
         st->last_IP_pts = AV_NOPTS_VALUE;
         st->reference_dts = AV_NOPTS_VALUE;
     }
+
+    return ret;
 }
 
 static void estimate_timings(AVFormatContext *ic, int64_t old_offset)
 {
     int64_t file_size;
+    URLProtocol *h = NULL;
+    int ret = 0;
 
     /* get the file size, if possible */
     if (ic->iformat->flags & AVFMT_NOFILE) {
@@ -2504,7 +3255,7 @@ static void estimate_timings(AVFormatContext *ic, int64_t old_offset)
          !strcmp(ic->iformat->name, "mpegts")) &&
         file_size && ic->pb->seekable) {
         /* get accurate estimate from the PTSes */
-        estimate_timings_from_pts(ic, old_offset);
+        ret = estimate_timings_from_pts(ic, old_offset);
         ic->duration_estimation_method = AVFMT_DURATION_FROM_PTS;
     } else if (has_duration(ic)) {
         /* at least one component has timings - we use them for all
@@ -2518,7 +3269,29 @@ static void estimate_timings(AVFormatContext *ic, int64_t old_offset)
         ic->duration_estimation_method = AVFMT_DURATION_FROM_BITRATE;
     }
     update_stream_timings(ic);
-
+    // 错误处理，只对ts流进行处理
+    if ((!strcmp(ic->iformat->name, "mpeg") ||
+         !strcmp(ic->iformat->name, "mpegts")) &&
+        file_size && ic->pb->seekable){
+        
+        if((ic->pb != NULL) && (ic->pb->opaque != NULL))
+        {
+            h = ((URLContext*)ic->pb->opaque)->prot;
+            if((h != NULL) && (h->name != NULL))
+            {
+                if(av_strcasecmp(h->name,"file") == 0)
+                {
+                    av_log(ic, AV_LOG_ERROR, "estimate_timings: local file");
+                    /*
+                    * 时间戳反转时，只对本地文件进行扫描整个文件的处理
+                    */
+                    if(ret == -1){
+                        scan_all_file_estimate_timings(ic, old_offset);
+                    }
+                }
+            }
+        }
+    }
     {
         int i;
         AVStream av_unused *st;
@@ -2567,7 +3340,7 @@ static int has_codec_parameters_for_avformat(AVFormatContext *s, AVStream *st, c
 			break;
         if (!avctx->width)
         {  value = 0;  FAIL("unspecified size", type, value); }
-        if (st->info->found_decoder >= 0 && avctx->pix_fmt == AV_PIX_FMT_NONE && s->mIPTVControlProbe != 1 && s->mIPTVControlProbe != 2)
+        if (st->info->found_decoder >= 0 && avctx->pix_fmt == AV_PIX_FMT_NONE && !check_fast_switch(s, st->codec, FAST_S_CHK_PIXFMT))
         {  value = 1;  FAIL("unspecified pixel format", type, value);}
         break;
     case AVMEDIA_TYPE_SUBTITLE:
@@ -2777,7 +3550,12 @@ tryAgain:
             break;
         }
 
-		
+
+     if (ic->nb_streams > 200) {
+        av_log(ic, AV_LOG_ERROR, "there are too many streams, return error.");
+        return AVERROR(EINVAL);
+     }
+     
 	 int video_find = 0;
 	 //av_log(NULL, AV_LOG_ERROR, "ic->mIPTVControlProbe = %d",ic->mIPTVControlProbe);
 	 for(i=0;i<ic->nb_streams;i++)
@@ -2798,7 +3576,7 @@ tryAgain:
  	 }
 
 	 if((i == ic->nb_streams && i > 1 && video_find == 1 && (strncmp(ic->filename, "file/fd::", 9) != 0)) 
-            || ((video_find == 1)&& ((ic->mIPTVControlProbe == 1 && FCC_SWITCH_ENABLE) || (ic->mIPTVControlProbe == 2))))
+            || ((video_find == 1)&& ((ic->mIPTVControlProbe == 1) || (ic->mIPTVControlProbe == 2))))
 	 {
 	 	av_log(ic, AV_LOG_ERROR, "all stream has parameter ************** break");
 	 	break ;
@@ -2943,7 +3721,7 @@ tryAgain:
             }
         }
 #if FF_API_R_FRAME_RATE
-        {
+        if (st->codec->codec_type == AVMEDIA_TYPE_VIDEO && !check_fast_switch(ic, st->codec, FAST_S_FRAME_RATE)) {
             int64_t last = st->info->last_dts;
 
             if(pkt->dts != AV_NOPTS_VALUE && last != AV_NOPTS_VALUE && pkt->dts > last){
@@ -2994,8 +3772,7 @@ tryAgain:
         */
         
         int need_decode = 1;
-        if ((ic->mIPTVControlProbe == 1 || ic->mIPTVControlProbe == 2) && 
-                st->codec && st->codec->codec_type == AVMEDIA_TYPE_VIDEO && st->codec->codec_id == AV_CODEC_ID_H264) {
+        if (check_fast_switch(ic, st->codec, FAST_S_DEC_FRAME)) {
             need_decode = 0;
         }
         try_decode_frame(st, pkt, (options && i < orig_nb_streams ) ? &options[i] : NULL, need_decode);
@@ -3047,15 +3824,10 @@ tryAgain:
         st = ic->streams[i];
         avcodec_close(st->codec);
     }
-
-    int has_h264_codec = 0;
-    int has_except_h264_codec = 0;
+            
     for(i=0;i<ic->nb_streams;i++) {
         st = ic->streams[i];
-        if (st->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
-            has_h264_codec = has_h264_codec || (st->codec->codec_id == AV_CODEC_ID_H264);
-            has_except_h264_codec = has_except_h264_codec || (st->codec->codec_id != AV_CODEC_ID_H264);
-            
+        if (st->codec->codec_type == AVMEDIA_TYPE_VIDEO && !check_fast_switch(ic, st->codec, FAST_S_FRAME_RATE)) {
             if(st->codec->codec_id == AV_CODEC_ID_RAWVIDEO && !st->codec->codec_tag && !st->codec->bits_per_coded_sample){
                 uint32_t tag= avcodec_pix_fmt_to_codec_tag(st->codec->pix_fmt);
                 if(ff_find_pix_fmt(ff_raw_pix_fmt_tags, tag) == st->codec->pix_fmt)
@@ -3151,6 +3923,18 @@ tryAgain:
         }
     }
 
+    //whether contains h264 codec
+    int has_h264_codec = 0;
+    //whether contains other codec, except h264
+    int has_except_h264_codec = 0;
+    for(i=0;i<ic->nb_streams;i++) {
+        st = ic->streams[i];
+        if (st->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
+            has_h264_codec = has_h264_codec || (st->codec->codec_id == AV_CODEC_ID_H264);
+            has_except_h264_codec = has_except_h264_codec || (st->codec->codec_id != AV_CODEC_ID_H264);
+        }
+    }
+    
     if(ic->probesize && !(ic->mIPTVControlProbe == 1 || ic->mIPTVControlProbe == 2)) {
         estimate_timings(ic, old_offset);
     } else{

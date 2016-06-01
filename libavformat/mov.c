@@ -43,6 +43,7 @@
 #include "libavcodec/get_bits.h"
 #include "id3v1.h"
 #include "mov_chan.h"
+#include "libavcodec/avcodec.h"
 
 #if CONFIG_ZLIB
 #include <zlib.h>
@@ -1940,6 +1941,7 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
     unsigned int i, j;
     uint64_t stream_size = 0;
     AVIndexEntry *mem;
+    int64_t keyframe_num = 0;
 
     /* adjust first dts according to edit list */
     if ((sc->empty_duration || sc->start_time) && mov->time_scale > 0) {
@@ -2020,6 +2022,7 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
                     e->size = sample_size;
                     e->min_distance = distance;
                     e->flags = keyframe ? AVINDEX_KEYFRAME : 0;
+                    if (keyframe) keyframe_num++;
                     av_dlog(mov->fc, "AVIndex stream %d, sample %d, offset %"PRIx64", dts %"PRId64", "
                             "size %d, distance %d, keyframe %d\n", st->index, current_sample,
                             current_offset, current_dts, sample_size, distance, keyframe);
@@ -2039,6 +2042,12 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
         }
         if (st->duration > 0)
             st->codec->bit_rate = stream_size*8*sc->time_scale/st->duration;
+
+        if (keyframe_num <= 3 && st->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
+            av_log(NULL, AV_LOG_ERROR, "warning: mov too few keyframe, num: %lld", keyframe_num);
+            int param = 1;
+            ff_codec_check_operate(&mov->fc->interrupt_callback, OPERATE_SET_MOV_SEEK_ANY, &param, NULL);
+        }
     } else {
         unsigned chunk_samples, total = 0;
 
@@ -3399,7 +3408,7 @@ static AVIndexEntry *mov_find_next_sample(AVFormatContext *s, AVStream **st)
 {
     switch(mov_check_read_policy(s)){
         case READ_POLICY_AIR:
-            //return mov_find_next_sample_special(s, st);
+            return mov_find_next_sample_special(s, st);
         default:
             break;
     }

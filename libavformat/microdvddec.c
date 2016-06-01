@@ -117,6 +117,7 @@ static int microdvd_read_header(AVFormatContext *s)
     avpriv_set_pts_info(st, 64, pts_info.den, pts_info.num);
     st->codec->codec_type = AVMEDIA_TYPE_SUBTITLE;
     st->codec->codec_id   = AV_CODEC_ID_MICRODVD;
+	microdvd->q.current_sub_idx = 0;
     return 0;
 }
 
@@ -124,6 +125,14 @@ static int microdvd_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     MicroDVDContext *microdvd = s->priv_data;
     return ff_subtitles_queue_read_packet(&microdvd->q, pkt);
+}
+
+static int microdvd_read_seek(AVFormatContext *s, int stream_index,
+                             int64_t min_ts, int64_t ts, int64_t max_ts, int flags)
+{
+    MicroDVDContext *microdvd = s->priv_data;
+    return ff_subtitles_queue_seek(&microdvd->q, s, stream_index,
+                                   min_ts, ts, max_ts, flags);
 }
 
 static int microdvd_read_close(AVFormatContext *s)
@@ -140,6 +149,7 @@ AVInputFormat ff_microdvd_demuxer = {
     .read_probe     = microdvd_probe,
     .read_header    = microdvd_read_header,
     .read_packet    = microdvd_read_packet,
+	.read_seek2     = microdvd_read_seek,
     .read_close     = microdvd_read_close,
     .flags          = AVFMT_GENERIC_INDEX,
 };

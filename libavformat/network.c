@@ -68,6 +68,10 @@ GCRY_THREAD_OPTION_PTHREAD_IMPL;
 #endif
 #endif
 
+void* CRYPTO_get_locking_callback(){
+    return NULL;
+}
+
 void ff_tls_init(void)
 {
     avpriv_lock_avformat();

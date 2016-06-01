@@ -30,7 +30,14 @@ static int srt_probe(AVProbeData *p)
 
     if (AV_RB24(ptr) == 0xEFBBBF)
         ptr += 3;  /* skip UTF-8 BOM */
+#if 1
+    num = atoi(ptr);
+    ptr += strcspn(ptr, "\n") + 1;
 
+    if(sscanf(ptr, "%*d:%*2d:%*2d%*1[,.]%*3d --> %*d:%*2d:%*2d%*1[,.]%3d", &v) == 1){
+        return AVPROBE_SCORE_MAX;
+    }
+#else
     for (i=0; i<2; i++) {
         if ((num == i || num + 1 == i)
             && sscanf(ptr, "%*d:%*2d:%*2d%*1[,.]%*3d --> %*d:%*2d:%*2d%*1[,.]%3d", &v) == 1)
@@ -38,6 +45,7 @@ static int srt_probe(AVProbeData *p)
         num = atoi(ptr);
         ptr += strcspn(ptr, "\n") + 1;
     }
+#endif
     return 0;
 }
 

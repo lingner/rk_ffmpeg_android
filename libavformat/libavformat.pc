@@ -9,6 +9,6 @@ Version: 54.35.100
 Requires: libavcodec = 54.71.100
 Requires.private: 
 Conflicts:
-Libs: -L${libdir} -lavformat -lssl -lcrypto -lm -lz -lgcc
+Libs: -L${libdir} -lavformat -lm -lz -lgcc
 Libs.private: 
 Cflags: -I${includedir}

@@ -858,7 +858,7 @@ static int open_input(HLSContext *c, struct variant *var)
     int ret;
     struct segment *seg = var->segments[var->cur_seq_no - var->start_seq_no];
     av_dict_set(&opts, "seekable", "0", 0);
-    av_dict_set(&opts, "timeout", "5000000", 0);
+    av_dict_set(&opts, "timeout", "3000000", 0);
     av_dict_set(&opts, "hls", "1", 0); // ht modified for hls timeout 500ms; other is 60s
     av_dict_set(&opts, "multiple_requests", "0", 0);
     av_dict_set(&opts, "hls_parse", "0", 0);
@@ -1014,9 +1014,9 @@ static int usleep_cmcc_parse_list(HLSContext *c, int parse_list_retry)
     } else if (parse_list_retry == 4) {
         sleepCnt = 4;//2s
     } else if (parse_list_retry == 5) {
-        sleepCnt = 4;//10;//5s  
+        sleepCnt = 10;//5s  
     } else {
-        sleepCnt = 4;//20;//10s
+        sleepCnt = 10;// 20 10s
     }
     
     while (sleepCnt > 0) {
@@ -1028,6 +1028,57 @@ static int usleep_cmcc_parse_list(HLSContext *c, int parse_list_retry)
     return 0;
 }
 
+static int check_parse_playlist(struct variant *v, int64_t *reload_interval, int parse_list_retry, int *ret)
+{
+    HLSContext *c = v->parent->priv_data;
+    *ret = 0;
+    
+    if(ff_check_operate(c->interrupt_callback,OPERATE_SEEK,NULL,NULL))
+    {
+        av_log(NULL,AV_LOG_ERROR,"read_data, new seek arrival,return immediately");
+        return AVERROR(ENOMEDIUM);
+    }
+    
+    if (!v->finished &&
+        av_gettime() - v->last_load_time >= *reload_interval) {
+        
+            
+#if HLS_DEBUG   
+    av_log(NULL, AV_LOG_ERROR,"reload_interval = %"PRId64", target_duration = %d\n",*reload_interval, v->target_duration);
+    av_log(NULL, AV_LOG_DEBUG,"%s:parse_playlist start:%s",__FUNCTION__,v->url);                   
+#endif            
+        int64_t startTime = av_gettime();
+        ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_START,-1); // c->interrupt_callback
+        if ((*ret = parse_playlist(c, v->url, v, NULL)) < 0) {
+            
+            av_log(NULL, AV_LOG_DEBUG,"read_data():parse_playlist, ret = 0x%x",*ret);
+			int errorcode = TIMEOUT;
+	        if(v != NULL)
+            {
+                URLContext *input = v->input;
+                if(input != NULL && input->errcode != 0)
+                {
+                    errorcode = input->errcode;
+                    av_log(NULL,AV_LOG_DEBUG,"read_data():parse_playlist, errorcode = %d",errorcode);
+                }
+            }
+            
+            int uret = usleep_cmcc_parse_list(c, parse_list_retry);
+            if (uret != 0) return uret;
+            ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_ERROR,errorcode);
+        } else {
+             //add info for AliyunOS
+             v->ts_last_time = av_gettime();
+           
+             ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_END,(av_gettime()-startTime)/1000);
+        }
+        /* If we need to reload the playlist again below (if
+         * there's still no more segments), switch to a reload
+         * interval of half the target duration. */
+        *reload_interval = v->target_duration * 500000LL;
+    }
+    return 0;
+}
 
 static int read_data(void *opaque, uint8_t *buf, int buf_size)
 {
@@ -1039,82 +1090,42 @@ static int read_data(void *opaque, uint8_t *buf, int buf_size)
     if(v->parent->exit_flag){
         return AVERROR_EOF;
     }
+    int64_t reload_interval = 0;
 restart:
-    if (!v->input) {
-        /* If this is a live stream and the reload interval has elapsed since
+    
+    /* If this is a live stream and the reload interval has elapsed since
          * the last playlist reload, reload the variant playlists now. */
-        int64_t reload_interval = v->n_segments > 0 ?
-                                  v->segments[v->n_segments - 1]->duration :
-                                  v->target_duration;
-        
-        c->seek_flags &= (~AVSEEK_FLAG_READ_NEED_OPEN_NEW_URL);                   
-#if HLS_DEBUG
-        av_log(NULL, AV_LOG_DEBUG,"reload_interval = %"PRId64"\n",reload_interval);
-#endif
+    reload_interval = v->n_segments > 0 ?
+                              v->segments[v->n_segments - 1]->duration :
+                              v->target_duration;     
+    //for huawei cmcc
+    reload_interval = FFMIN(reload_interval, FFMIN(v->target_duration, 9));
+    
+    reload_interval *= 1000000;
+    int expired_list = 0;
+    int chk_ret = 0;
+    
+reload:    
 
-        reload_interval *= 1000000;
-        int expired_list = 0;
-        //for huawei
-        reload_interval -= 500000;
-reload:
-        if(ff_check_operate(c->interrupt_callback,OPERATE_SEEK,NULL,NULL))
-        {
-            av_log(NULL,AV_LOG_ERROR,"read_data, new seek arrival,return immediately");
-            return AVERROR(ENOMEDIUM);
+    chk_ret = check_parse_playlist(v, &reload_interval, parse_list_retry, &ret);
+    if (chk_ret != 0) {
+        return chk_ret;
+    }
+
+    if (ret < 0) {
+        parse_list_retry ++;
+        if(expired_list == 1){
+            av_log(NULL,AV_LOG_DEBUG,"open_input time out, need retry parse list %d", parse_list_retry);
+            goto reload;
         }
-        
-        if (!v->finished &&
-            av_gettime() - v->last_load_time >= reload_interval) {
-            
-#if HLS_DEBUG   
-    av_log(NULL, AV_LOG_DEBUG,"%s:parse_playlist start:%s",__FUNCTION__,v->url);                   
-#endif            
-            int64_t startTime = av_gettime();
-            ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_START,-1); // c->interrupt_callback
-            if ((ret = parse_playlist(c, v->url, v, NULL)) < 0){
-                parse_list_retry ++;
-                av_log(NULL, AV_LOG_DEBUG,"read_data():parse_playlist, ret = 0x%x",ret);
-				int errorcode = TIMEOUT;
-		        if(v != NULL)
-	            {
-	                URLContext *input = v->input;
-	                if(input != NULL)
-	                {
-			      if(input->errcode != 0)
-                              {
-	                           errorcode = input->errcode;
-	                           av_log(NULL,AV_LOG_DEBUG,"read_data():parse_playlist, errorcode = %d",errorcode);
-                              }
-	                }
-	            }
-                
-                int uret = usleep_cmcc_parse_list(c, parse_list_retry);
-                if (uret == AVERROR_EXIT) {
-                    return uret;
-                }
-                ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_ERROR,errorcode);
-                
-                if(expired_list == 1){
-                    av_log(NULL,AV_LOG_DEBUG,"open_input time out, need retry parse list %d", parse_list_retry);
-                    goto reload;
-                }
-                
-            }
-            else
-            {
-                 //add info for AliyunOS
-                 v->ts_last_time = av_gettime();
-               
-                 ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_END,(av_gettime()-startTime)/1000);
-            }
-            /* If we need to reload the playlist again below (if
-             * there's still no more segments), switch to a reload
-             * interval of half the target duration. */
-            reload_interval = v->target_duration * 500000LL;
-        }
-        else{
-            expired_list = 0;
-        }
+    } else {
+        expired_list = 0;
+        parse_list_retry = 0;
+    }
+
+    if (!v->input) {
+        c->seek_flags &= (~AVSEEK_FLAG_READ_NEED_OPEN_NEW_URL);
+
         if (v->cur_seq_no < v->start_seq_no) {
             av_log(NULL, AV_LOG_DEBUG,
                    "skipping %d segments ahead, expired from playlists\n",
@@ -1276,40 +1287,20 @@ reload:
         }
         expired_list = 0;
         c->read_seq_no = v->cur_seq_no;
+        last_open_timeUs = av_gettime();
     }
-    last_open_timeUs = av_gettime();
-	int temp = 1 + (v->n_segments > 0 ?
-                                  v->segments[v->cur_seq_no- v->start_seq_no]->duration/2 :
-                                  v->target_duration/2);   
-    retry = temp;//for huashu auto return by timeout
-#if HLS_DEBUG
-//    av_log(NULL,AV_LOG_DEBUG,"RETRY = %d",retry);
-#endif
-	struct segment *seg = v->segments[v->cur_seq_no - v->start_seq_no]; //add by xhr, for Bluray
+    
+    retry = FFMAX(v->target_duration / 2, 3);
     int64_t start_time = av_gettime();
     while(retry--){
-    ret = ffurl_read(v->input, buf, buf_size);
-    if (ret > 0){
-        if(0 == v->ts_first_time){
-             v->ts_first_time = av_gettime();
-        }
-		int64_t off_time = av_gettime() - start_time;
-		int32_t size = GetSize(c->BandWidthqueue);
-		EnQueue(c->BandWidthqueue,ret, off_time);
-        
-			if(seg->is_seek){
-				
-				//int64_t pos = avio_tell(&v->pb);
-				//int64_t total = avio_size(&v->pb);
-				int64_t seek_position = ffurl_seek(v->input, 0, SEEK_CUR);
-				//av_log(NULL, AV_LOG_DEBUG, "Hery, seek_position = %lld", seek_position);
-				//int64_t total = ffurl_size(v->input);
-				//av_log(NULL, AV_LOG_DEBUG, "Hery, pos = %lld, total = %lld", pos, total);
-				if (seek_position  >= seg->seek_time_end){
-					av_log(NULL, AV_LOG_DEBUG, "Hery, read data break = %lld", seek_position);
-					break;
-				}
-			}
+        ret = ffurl_read(v->input, buf, buf_size);
+        if (ret > 0){
+            if(0 == v->ts_first_time){
+                 v->ts_first_time = av_gettime();
+            }
+    		int64_t off_time = av_gettime() - start_time;
+    		int32_t size = GetSize(c->BandWidthqueue);
+    		EnQueue(c->BandWidthqueue,ret, off_time);
             return ret;
         }
         if(ret == 0 ){
@@ -1332,21 +1323,25 @@ reload:
             av_log(NULL,AV_LOG_ERROR,"read_data, new seek arrival,return immediately");
             return AVERROR(ENOMEDIUM);
         }
+
+        if (ret < 0) {
+            check_parse_playlist(v, &reload_interval, parse_list_retry, &ret);
+        }
        
         av_log(NULL,AV_LOG_DEBUG,"read:retry=%d,ret=%d",retry,ret);
     }
 #if HLS_DEBUG
     av_log(NULL, AV_LOG_DEBUG, "read_data:parse one Segment ret = 0x%x",ret);
 #endif
-    ffurl_close(v->input);
-    v->input = NULL;
-    
     //save the newest open_input url to check repeat play
     AVIOParams *params = c->interrupt_callback->ioparams;
-    if (!v->finished && params && seg) {
-        strcpy(params->last_seq_url, seg->url);
+    if (!v->finished && params && v->input) {
+        strcpy(params->last_seq_url, v->input->filename);
         av_log(NULL, AV_LOG_DEBUG,"%s: save url=(%s)",__FUNCTION__, params->last_seq_url);
     }
+
+    ffurl_close(v->input);
+    v->input = NULL;
 
     if(ret != -ETIMEDOUT)
     {

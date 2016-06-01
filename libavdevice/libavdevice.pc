@@ -9,6 +9,6 @@ Version: 54.3.100
 Requires: libavformat = 54.35.100
 Requires.private: 
 Conflicts:
-Libs: -L${libdir} -lavdevice -lssl -lcrypto -lm -lz -lgcc
+Libs: -L${libdir} -lavdevice -lm -lz -lgcc
 Libs.private: 
 Cflags: -I${includedir}

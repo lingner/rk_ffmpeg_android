@@ -20,8 +20,9 @@ FFmpeg README
   (eg. NDK=/home/androd_ndk/android-ndk-r9d)
 * Move this project to Your_SDK_Root/external/ffmpeg
 * Change Permissions of configure and build_32.sh. 
-  #chmod 777 configure
-  #chmod 777 build_32.sh
+  #chmod 766 configure
+  #chmod 766 build_32.sh
+  #chmod 766 version.sh
 * execute ./build_32.sh, then you will find libffmpeg.so in directory(./android/armv7-a/) 
 
 4) You Can Use Precompiled Library(libffmpeg.so)
