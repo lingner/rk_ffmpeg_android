@@ -746,7 +746,7 @@ typedef struct H264Context {
     int last_nal_type;
     FILE * sps_writefd;
     int sps_writeok;
-    int force_sps;
+    int split_sps_flags;
 
     int first;
 

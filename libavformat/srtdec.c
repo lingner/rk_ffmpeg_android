@@ -94,11 +94,22 @@ static int srt_read_packet(AVFormatContext *s, AVPacket *pkt)
     char buffer[2048], *ptr = buffer, *ptr2;
     int64_t pos = avio_tell(s->pb);
     int res = AVERROR_EOF;
+    int line_no = 0;
 
     do {
         ptr2 = ptr;
         ptr += ff_get_line(s->pb, ptr, sizeof(buffer)+buffer-ptr);
+
+        //fix some srt file contain two lines(\r\n) per subtitletxt
+        if (line_no < 1 && is_eol(buffer[0]) && !url_feof(s->pb) && ptr-buffer<sizeof(buffer)-1) {
+            ptr = buffer;
+            ptr2 = ptr;
+            ptr += ff_get_line(s->pb, ptr, sizeof(buffer)+buffer-ptr);
+            av_log(NULL, AV_LOG_ERROR, "%s: continue to read next line", __FUNCTION__);
+        }
+        line_no ++;
     } while (!is_eol(*ptr2) && !url_feof(s->pb) && ptr-buffer<sizeof(buffer)-1);
+    
 
     if (buffer[0]) {
         int64_t pts;

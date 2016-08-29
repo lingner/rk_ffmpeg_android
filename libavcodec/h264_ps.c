@@ -516,6 +516,84 @@ int ff_h264_decode_seq_parameter_set(H264Context *h){
     av_free(h->sps_buffers[sps_id]);
     h->sps_buffers[sps_id]= sps;
     h->sps = *sps;
+    
+    switch (h->sps.bit_depth_luma) {
+    case 9:
+ 	   if (CHROMA444) {
+ 		   if (s->avctx->colorspace == AVCOL_SPC_RGB) {
+ 			   s->avctx->pix_fmt = AV_PIX_FMT_GBRP9;
+ 		   } else
+ 			   s->avctx->pix_fmt = AV_PIX_FMT_YUV444P9;
+ 	   } else if (CHROMA422)
+ 		   s->avctx->pix_fmt = AV_PIX_FMT_YUV422P9;
+ 	   else
+ 		   s->avctx->pix_fmt = AV_PIX_FMT_YUV420P9;
+ 	   break;
+    case 10:
+ 	   if (CHROMA444) {
+ 		   if (s->avctx->colorspace == AVCOL_SPC_RGB) {
+ 			   s->avctx->pix_fmt = AV_PIX_FMT_GBRP10;
+ 		   } else
+ 			   s->avctx->pix_fmt = AV_PIX_FMT_YUV444P10;
+ 	   } else if (CHROMA422)
+ 		   s->avctx->pix_fmt = AV_PIX_FMT_YUV422P10;
+ 	   else
+ 		   s->avctx->pix_fmt = AV_PIX_FMT_YUV420P10;
+ 	   break;
+    case 12:
+ 	   if (CHROMA444) {
+ 		   if (s->avctx->colorspace == AVCOL_SPC_RGB) {
+ 			   s->avctx->pix_fmt = AV_PIX_FMT_GBRP12;
+ 		   } else
+ 			   s->avctx->pix_fmt = AV_PIX_FMT_YUV444P12;
+ 	   } else if (CHROMA422)
+ 		   s->avctx->pix_fmt = AV_PIX_FMT_YUV422P12;
+ 	   else
+ 		   s->avctx->pix_fmt = AV_PIX_FMT_YUV420P12;
+ 	   break;
+    case 14:
+ 	   if (CHROMA444) {
+ 		   if (s->avctx->colorspace == AVCOL_SPC_RGB) {
+ 			   s->avctx->pix_fmt = AV_PIX_FMT_GBRP14;
+ 		   } else
+ 			   s->avctx->pix_fmt = AV_PIX_FMT_YUV444P14;
+ 	   } else if (CHROMA422)
+ 		   s->avctx->pix_fmt = AV_PIX_FMT_YUV422P14;
+ 	   else
+ 		   s->avctx->pix_fmt = AV_PIX_FMT_YUV420P14;
+ 	   break;
+    case 8:
+ 	   if (CHROMA444) {
+		   s->avctx->pix_fmt = s->avctx->color_range == AVCOL_RANGE_JPEG ? AV_PIX_FMT_YUVJ444P: AV_PIX_FMT_YUV444P;
+		   if (s->avctx->colorspace == AVCOL_SPC_RGB) {
+			   s->avctx->pix_fmt = AV_PIX_FMT_GBR24P;
+			   av_log(h->s.avctx, AV_LOG_DEBUG, "Detected GBR colorspace.\n");
+		   } else if (s->avctx->colorspace == AVCOL_SPC_YCGCO) {
+			   av_log(h->s.avctx, AV_LOG_WARNING, "Detected unsupported YCgCo colorspace.\n");
+		   }
+ 	   } else if (CHROMA422) {
+ 		   s->avctx->pix_fmt = s->avctx->color_range == AVCOL_RANGE_JPEG ? AV_PIX_FMT_YUVJ422P: AV_PIX_FMT_YUV422P;
+ 	   } else {
+ 	       const enum AVPixelFormat hwaccel_pixfmt_list_h264_jpeg_420[] = { AV_PIX_FMT_DXVA2_VLD,
+                                                                            AV_PIX_FMT_VAAPI_VLD,
+                                                                            AV_PIX_FMT_VDA_VLD,
+                                                                            AV_PIX_FMT_YUVJ420P,
+                                                                            AV_PIX_FMT_NONE
+                                                                          };
+		   if (s->avctx->codec)
+ 	           s->avctx->pix_fmt = s->avctx->get_format(s->avctx,
+                                                        s->avctx->codec->pix_fmts ?
+                                                        s->avctx->codec->pix_fmts :
+                                                        s->avctx->color_range == AVCOL_RANGE_JPEG ?
+                                                        hwaccel_pixfmt_list_h264_jpeg_420 :
+                                                        ff_hwaccel_pixfmt_list_420);
+ 	   }
+ 	   break;
+    default:
+ 	   av_log(s->avctx, AV_LOG_ERROR, "Unsupported bit depth: %d\n", h->sps.bit_depth_luma);
+    }
+    
+    
     return 0;
 fail:
     av_free(sps);

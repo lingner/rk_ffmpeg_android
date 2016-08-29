@@ -111,6 +111,11 @@ static int ff_h264_find_frame_end(H264Context *h, const uint8_t *buf, int buf_si
                 if(pc->frame_start_found){
                     i++;
                     goto found;
+                } else if ((h->split_sps_flags & PARSER_FLAG_USE_SPLIT_SPS) && v == NAL_SPS && h->sps.mb_width == 0) {
+                    av_log(NULL, AV_LOG_ERROR, "ff_h264_find_frame_end find first sps!");
+                    state += 8;
+                    h->split_sps_flags &= (~PARSER_FLAG_USE_SPLIT_SPS);
+                    continue;
                 }
 			/*
 			 * NAL==5, IDR帧，肯定是一个序列的间隔。
@@ -260,7 +265,22 @@ static inline int parse_nal_units(AVCodecParserContext *s,
             }
 #endif
             ff_h264_decode_seq_parameter_set(h);
+            
+            if (avctx->width <= 0) {
+            	s->key_frame = 1;
+            	int mb_width  = h->sps.mb_width;
+            	int mb_height = h->sps.mb_height * (2 - h->sps.frame_mbs_only_flag);
+            	int chroma_y_shift = h->sps.chroma_format_idc <= 1; // 400 uses yuv420p
+            	int pic_width  = 16 * mb_width;
+            	int pic_height = 16 * mb_height;
+            
+            	avcodec_set_dimensions(avctx, pic_width, pic_height);
+            	avctx->width  -= (2>>CHROMA444)*FFMIN(h->sps.crop_right, (8<<CHROMA444)-1);
+            	avctx->height -= (1<<chroma_y_shift)*FFMIN(h->sps.crop_bottom, (16>>chroma_y_shift)-1) * (2 - h->sps.frame_mbs_only_flag);
+            	av_log(NULL, AV_LOG_ERROR, "%s parse avctx->width: %d", __FUNCTION__, avctx->width);
+            }
 
+#if 0
             if ((h->first == 0) && (buf_size > 350)) {
                 if ((buf[0] & 0x1f) == 0x07) {
                         sps_off = 0;
@@ -337,6 +357,7 @@ sps_pps_err:
                 pps_buf = NULL;
             }
             h->first = 1;
+#endif      
             break;
         case NAL_PPS:
             ff_h264_decode_picture_parameter_set(h, h->s.gb.size_in_bits);
@@ -436,6 +457,15 @@ sps_pps_err:
                 avctx->height -= (1<<chroma_y_shift)*FFMIN(h->sps.crop_bottom, (16>>chroma_y_shift)-1) * (2 - h->sps.frame_mbs_only_flag);
                 av_log(NULL, AV_LOG_ERROR, "%s parse avctx->width: %d", __FUNCTION__, avctx->width);
             }
+
+            if ((h->sps.timing_info_present_flag)) {
+                int64_t den = h->sps.time_scale;
+                if (h->x264_build < 44U)
+                    den *= 2;
+                av_reduce(&avctx->time_base.num, &avctx->time_base.den,
+                    h->sps.num_units_in_tick, den, 1 << 30);
+                //av_log(NULL, AV_LOG_ERROR, "%s parse avctx->time_base: %d-%d", __FUNCTION__, avctx->time_base.den,avctx->time_base.num);
+            }
             
             return 0; /* no need to evaluate the rest */
 
@@ -450,7 +480,12 @@ sps_pps_err:
     if (q264)
         return 0;
     /* didn't find a picture! */
-    av_log(h->s.avctx, AV_LOG_ERROR, "missing picture in access unit with size %d\n", buf_size);
+    av_log(h->s.avctx, AV_LOG_ERROR, "missing picture in access unit with size %d is_sps:%d \n", buf_size, h->nal_unit_type == NAL_SPS);
+    if (h->nal_unit_type == NAL_SPS) {
+        s->flags |= PARSER_FLAG_SPS_NOT_PICTURE;
+        return 0;
+    }
+	
     return -1;
 }
 
@@ -480,6 +515,9 @@ static int h264_parse(AVCodecParserContext *s,
     if(s->flags & PARSER_FLAG_COMPLETE_FRAMES){
         next= buf_size;
     }else{
+        if(s->flags & PARSER_FLAG_USE_SPLIT_SPS) {
+            h->split_sps_flags |= PARSER_FLAG_USE_SPLIT_SPS;
+        }
         next= ff_h264_find_frame_end(h, buf, buf_size);
 
         if (ff_combine_frame(pc, next, &buf, &buf_size) < 0) {
@@ -567,7 +605,8 @@ static int init(AVCodecParserContext *s)
     H264Context *h = s->priv_data;
     h->thread_context[0] = h;
     h->s.slice_context_count = 1;
-
+    h->x264_build = -1;
+    
 #if RECORD_SPS
     h->sps_writefd = fopen("/data/buf.pps","w");
     

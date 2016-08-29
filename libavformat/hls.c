@@ -434,7 +434,7 @@ static int parse_playlist(HLSContext *c, const char *url,
         url = ioparams->url;
     }
 #if HLS_DEBUG
-    av_log(NULL, AV_LOG_DEBUG,"HLS parse_playlist in, url = %s\n", url);
+    //av_log(NULL, AV_LOG_ERROR,"[debug-hls]parse_playlist, url = %s\n", url);
 #endif
 
 	DistontinutyStatus distontinuty_status = Distontinuty_NONE; //add by xhr, for QVOD
@@ -527,6 +527,7 @@ static int parse_playlist(HLSContext *c, const char *url,
         free_segment_list(var);
         var->finished = 0;
     }
+    int log_line_num = 0;
     while (!url_feof(in)) {
 		//add by xhr ,for prevent m3u8 too big lead full leap
 		if(var && var->n_segments >=4096)
@@ -536,7 +537,11 @@ static int parse_playlist(HLSContext *c, const char *url,
         
         memset(line, 0, sizeof(line));
         read_chomp_line(in, line, sizeof(line));
-//        av_log(NULL,AV_LOG_ERROR,"%s",line);
+        
+        if (log_line_num < 50) {
+            av_log(NULL, AV_LOG_DEBUG, "%s", line);
+            log_line_num++;
+        }
 
         /*
         * 如果read_chomp_line读失败，将导致http_buf_read调用special_read
@@ -840,8 +845,11 @@ static int parse_playlist(HLSContext *c, const char *url,
 #if HLS_DEBUG
     if(var)
     {
+        struct variant *var_0 = c->variants[0];
+        //av_log(NULL, AV_LOG_ERROR,"[debug-hls](var->cur_seq_no = %d; var->bandwidth =% d ",var_0->cur_seq_no, var_0->bandwidth);
 
-        av_log(NULL, AV_LOG_DEBUG,"%s::firstQ=%d,curQ=%d,LastQ=%d,var->n_segments = %d",__FUNCTION__,var->start_seq_no,var->cur_seq_no,var->start_seq_no+var->n_segments,var->n_segments);
+        av_log(NULL, AV_LOG_ERROR,"[debug-hls]%s cur_seq_no=%d,start_seq_no=%d,last_seq_no=%d,var->n_segments = %d",
+                     __FUNCTION__,var->cur_seq_no,var->start_seq_no,var->start_seq_no+var->n_segments,var->n_segments);
     }
 
 #endif
@@ -859,7 +867,10 @@ static int open_input(HLSContext *c, struct variant *var)
     struct segment *seg = var->segments[var->cur_seq_no - var->start_seq_no];
     av_dict_set(&opts, "seekable", "0", 0);
     av_dict_set(&opts, "timeout", "3000000", 0);
-    av_dict_set(&opts, "hls", "1", 0); // ht modified for hls timeout 500ms; other is 60s
+    if (!var->finished)
+        av_dict_set(&opts, "hls", "1", 0); // ht modified for hls timeout 500ms; other is 60s
+    else
+        av_dict_set(&opts, "hls", "2", 0);
     av_dict_set(&opts, "multiple_requests", "0", 0);
     av_dict_set(&opts, "hls_parse", "0", 0);
 
@@ -1145,7 +1156,7 @@ reload:
                 v->cur_seq_no = v->start_seq_no;
             }
         }
-		av_log(NULL,AV_LOG_DEBUG,"read_data:cur_seq_no = %d,start_seq_no = %d,n_segments = %d",v->cur_seq_no,
+		av_log(NULL,AV_LOG_ERROR,"[debug-hls]read_data     cur_seq_no = %d,start_seq_no = %d,n_segments = %d",v->cur_seq_no,
 			v->start_seq_no,v->n_segments);
         if (v->cur_seq_no >= v->start_seq_no + v->n_segments) {
             if (v->finished){
@@ -1170,7 +1181,7 @@ reload:
             //Slice smooth handle, EXT-X-MEDIA-SEQUENCE  become too smaller than last time suddenly
             if(v->n_segments > 0 && (v->cur_seq_no-(v->start_seq_no + v->n_segments)>v->n_segments*10)){
                 sliceSmooth++;
-                av_log(NULL, AV_LOG_ERROR,"%s:slice smooth times=%d, v->cur_seq_no=%d, v->start_seq_no=%d, v->n_segments=%d\n",
+                av_log(NULL, AV_LOG_ERROR,"[debug-hls]%s:slice smooth times=%d, v->cur_seq_no=%d, v->start_seq_no=%d, v->n_segments=%d\n",
                             __FUNCTION__, sliceSmooth, v->cur_seq_no, v->start_seq_no, v->n_segments);
             }
             if(sliceSmooth>=3){
@@ -1205,14 +1216,15 @@ reload:
         v->ts_send_time = av_gettime();
         v->ts_first_time = 0;
         v->ts_last_time = 0;
-        av_log(NULL, AV_LOG_DEBUG,"%s:need reload,v->cur_seq_no = %d,load_time = %lld",__FUNCTION__,v->cur_seq_no,v->load_time);
+        //av_log(NULL, AV_LOG_ERROR, "[debug-hls]DOWNLOAD_START v->cur_seq_no = %d,v->bandwidth = %d; startTime = %lld",
+        //                v->cur_seq_no,v->bandwidth, v->load_time);
 
         //---------------------------------------------检测Discontinuity后重复切片(CNTV)----------------------------------------------//
         AVIOParams *params = c->interrupt_callback->ioparams;
         struct segment *tmpseg = v->segments[v->cur_seq_no - v->start_seq_no];
-        if (!v->finished && params && sliceSmooth == 0 && (/*has_segment_discontinuity(v) || */(strcmp(tmpseg->url, params->last_seq_url) == 0))) {
+        if (!v->finished && params && sliceSmooth == 0 && params->last_seq_url[0] != '\0'/*(seq_discontinuity || (strcmp(tmpseg->url, params->last_seq_url) == 0))*/) {
             int index = search_segment_index(v, params->last_seq_url);
-            av_log(NULL, AV_LOG_ERROR, "%s:search_segment_index seq = %d\n", __FUNCTION__, (v->start_seq_no + index));
+            //av_log(NULL, AV_LOG_ERROR, "%s:search_segment_index seq = %d\n", __FUNCTION__, (v->start_seq_no + index));
             if (index >= v->n_segments - 1) {
                 av_log(NULL, AV_LOG_ERROR,"%s:discontinuity last seq = %d, reload\n",__FUNCTION__, i);
                 reload_interval = 3000000;
@@ -1220,12 +1232,15 @@ reload:
                 goto reload;
             } else if(index >= 0){
                 v->cur_seq_no = v->start_seq_no + index + 1;
-                av_log(NULL, AV_LOG_ERROR,"%s:discontinuity next seq = %d, reload\n",__FUNCTION__, v->cur_seq_no);
+                av_log(NULL, AV_LOG_DEBUG, "%s:continuity next seq = %d\n",__FUNCTION__, v->cur_seq_no);
             }
         }
         
         ret = open_input(c , v);
         if (ret < 0){
+            if (params) {
+                params->last_seq_url[0] = '\0';
+            }
             av_log(NULL, AV_LOG_DEBUG, "HLS read data %d\n",ret);
 			int errorcode = TIMEOUT;
             int64_t expired_interval = 30;//30s
@@ -1290,10 +1305,12 @@ reload:
         last_open_timeUs = av_gettime();
     }
     
-    retry = FFMAX(v->target_duration / 2, 3);
+    retry = FFMIN(v->target_duration / 2, 3);
     int64_t start_time = av_gettime();
     while(retry--){
         ret = ffurl_read(v->input, buf, buf_size);
+        av_usleep(5*1000);
+
         if (ret > 0){
             if(0 == v->ts_first_time){
                  v->ts_first_time = av_gettime();
@@ -1350,13 +1367,16 @@ reload:
         
         // send download end event
         int64_t endTime = av_gettime();
-        av_log(NULL, AV_LOG_DEBUG, "read_data(), download ts file cur_seq_no = %d,time = %lld,startTime = %lld",v->cur_seq_no,endTime,v->load_time);
+        av_log(NULL, AV_LOG_ERROR, "[debug-hls]DOWNLOAD_END   v->cur_seq_no = %d,v->bandwidth = %d, endTime = %lld,startTime = %lld",
+                              v->cur_seq_no,v->bandwidth, endTime,v->load_time);
+        av_log(NULL, AV_LOG_ERROR, "[debug-hls]--");
         ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_END,(endTime - v->load_time)/1000);
     }
     else
     {
         ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_TIMEOUT, v->cur_seq_no);
         ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_ERROR,TIMEOUT);
+        av_log(NULL, AV_LOG_ERROR, "[debug-hls]DOWNLOAD_TIMEOUT, v->cur_seq_no = %d", v->cur_seq_no);
     }
     v->cur_seq_no++;
 
@@ -1377,11 +1397,12 @@ reload:
                 --index;
             }
 #if HLS_DEBUG
-            av_log(NULL,AV_LOG_DEBUG,"bandwidth=%d,c->bandwidth=%d",v->bandwidth,c->bandwidth_info[index]->bandwidth );
+            //av_log(NULL,AV_LOG_DEBUG,"[debug-hls]bandwidth=%d,c->bandwidth=%d",v->bandwidth,c->bandwidth_info[index]->bandwidth );
 #endif
             if(v->bandwidth != c->bandwidth_info[index]->bandwidth)
             {
-                av_log(NULL,AV_LOG_DEBUG,"final estimateBH(%d)=%d",index,c->bandwidth_info[index]->bandwidth);
+                av_log(NULL,AV_LOG_ERROR,"[debug-hls]index=%d; curBandWidth=%d; newBandWidth=%d",
+                                  index, v->bandwidth, c->bandwidth_info[index]->bandwidth);
                 memcpy(v->url,c->bandwidth_info[index]->url,sizeof(v->url));
                 v->bandwidth = c->bandwidth_info[index]->bandwidth;
                 v->finished = 0;
@@ -1416,7 +1437,7 @@ reload:
 
 static int hls_read_header(AVFormatContext *s)
 {
-	URLContext *u = (s->flags & AVFMT_FLAG_CUSTOM_IO) ? NULL : s->pb->opaque;
+    URLContext *u = (s->flags & AVFMT_FLAG_CUSTOM_IO) ? NULL : s->pb->opaque;
     HLSContext *c = s->priv_data;
     int ret = 0, i, j, stream_offset = 0,retry = 0;
 

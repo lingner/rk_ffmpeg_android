@@ -158,6 +158,10 @@ int av_parser_parse2(AVCodecParserContext *s,
         /* offset of the next frame */
         s->next_frame_offset = s->cur_offset + index;
         s->fetch_timestamp=1;
+        if (s->flags & PARSER_FLAG_SPS_NOT_PICTURE) {
+            s->fetch_timestamp = 0;
+            s->flags &= (~PARSER_FLAG_SPS_NOT_PICTURE);
+        }
     }
     if (index < 0)
         index = 0;

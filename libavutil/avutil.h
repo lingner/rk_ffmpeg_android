@@ -269,4 +269,6 @@ static inline void *av_x_if_null(const void *p, const void *x)
 #define OPERATE_GET_SEI_USER_DATA 6
 #define OPERATE_GET_MKV_GET_SEGMENT_INFO 7
 #define OPERATE_SET_MOV_SEEK_ANY 8
+#define OPERATE_GET_NETWORK_RECONNECT 9
+#define OPERATE_SET_STREAM_INFO 100
 #endif /* AVUTIL_AVUTIL_H */

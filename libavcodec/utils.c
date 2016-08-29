@@ -2237,6 +2237,11 @@ const char *avcodec_license(void)
 
 void avcodec_flush_buffers(AVCodecContext *avctx)
 {
+    /*
+    * codec没有打开时,不要flush
+    */
+    if (!avcodec_is_open(avctx))
+        return;
     /*  
     * add for hh
     * 使用不包含杜比的ffmpeg库，源码输出时播放杜比片源，

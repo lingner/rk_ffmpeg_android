@@ -506,7 +506,7 @@ static int udp_open(URLContext *h, const char *uri, int flags)
     char *sources[32];
 
     h->is_streamed = 1;
-
+    av_log(NULL, AV_LOG_ERROR, "udp_open: uri = %s",uri);
     is_output = !(flags & AVIO_FLAG_READ);
     if (!s->buffer_size) /* if not set explicitly */
         s->buffer_size = is_output ? UDP_TX_BUF_SIZE : UDP_MAX_PKT_SIZE;

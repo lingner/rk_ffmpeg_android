@@ -775,7 +775,6 @@ static int mov_read_moov(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     /* we parsed the 'moov' atom, we can terminate the parsing as soon as we find the 'mdat' */
     /* so we don't parse the whole file if over a network */
     c->found_moov=1;
-    c->read_packet_policy=READ_POLICY_UNKOWN;
     return 0; /* now go for mdat */
 }
 
@@ -2184,6 +2183,42 @@ static int mov_open_dref(AVIOContext **pb, const char *src, MOVDref *ref,
     return AVERROR(ENOENT);
 }
 
+static int mov_check_connect_policy(MOVContext *mc, AVStream *st){
+    int score = 0;
+    MOVStreamContext *sc = st->priv_data;
+    sc->pb_slave = NULL;
+
+    if (NULL == mc->fc || NULL == mc->fc->filename || NULL == st->codec) {
+        return -1;
+    }
+    
+    const char* videouri = mc->fc->filename;
+    if(NULL ==strstr(videouri,"http:")){
+        av_log(NULL, AV_LOG_ERROR, "[TRACE-MOV]mov_check_connect_policy: local case  (chunk=%4d;sample=%6d;keyframe=%4d)",
+                                    sc->chunk_count, sc->sample_count,sc->keyframe_count);
+        return -1;
+    }else{
+        av_log(NULL, AV_LOG_ERROR, "[TRACE-MOV]mov_check_connect_policy: network case(chunk=%4d;sample=%6d;keyframe=%4d)",
+                                    sc->chunk_count, sc->sample_count,sc->keyframe_count);
+    }
+
+    if ((st->codec->codec_type == AVMEDIA_TYPE_AUDIO)||(st->codec->codec_type == AVMEDIA_TYPE_SUBTITLE)) {
+        int s_per_chunk = sc->sample_count/sc->chunk_count;
+        if(s_per_chunk >= 10){
+            av_log(NULL, AV_LOG_ERROR, "[TRACE-MOV]mov_check_connect_policy: chunk case");
+            if (!avio_open2(&sc->pb_slave, mc->fc->filename, AVIO_FLAG_READ, &mc->fc->interrupt_callback, NULL)){
+                av_log(mc->fc, AV_LOG_ERROR, "[TRACE-MOV]mov_check_connect_policy open new AVIOContext, sc->pb_slave=%p", sc->pb_slave);
+            }else{
+                sc->pb_slave = NULL;
+                av_log(mc->fc, AV_LOG_ERROR, "[TRACE-MOV]mov_check_connect_policy Fail to open AVIOContext");
+            }
+        }
+    }
+
+    return 0;
+}
+
+
 static int mov_read_trak(MOVContext *c, AVIOContext *pb, MOVAtom atom)
 {
     AVStream *st;
@@ -2265,6 +2300,8 @@ static int mov_read_trak(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         st->codec->height= 0;
         break;
     }
+
+    mov_check_connect_policy(c, st);
 
     /* Do not need those anymore. */
     av_freep(&sc->chunk_offsets);
@@ -3084,6 +3121,12 @@ static int mov_read_close(AVFormatContext *s)
         av_freep(&sc->trefs);
         if (sc->pb && sc->pb != s->pb)
             avio_close(sc->pb);
+        if (sc->pb_slave&& sc->pb_slave != s->pb){
+            avio_close(sc->pb_slave);
+            sc->pb_slave = NULL;
+            av_log(NULL, AV_LOG_ERROR, "[TRACE]mov_read_close close MOVStreamContext->pb_slave");
+        }
+
         sc->pb = NULL;
         av_freep(&sc->chunk_offsets);
         av_freep(&sc->keyframes);
@@ -3215,203 +3258,43 @@ static int mov_read_header(AVFormatContext *s)
     return 0;
 }
 
+static AVIndexEntry *mov_find_next_sample_special(AVFormatContext *s, AVStream **st)
+{
+    AVIndexEntry *sample = NULL;
+    int64_t best_dts = INT64_MAX;
+    int i;
+    int best_pos = INT_MAX;
+    char buffer[1024] = {0};
+    for (i = 0; i < s->nb_streams; i++) {
+        AVStream *avst = s->streams[i];
+        MOVStreamContext *msc = avst->priv_data;
+        if (msc->pb && msc->current_sample < avst->nb_index_entries) {
+            AVIndexEntry *current_sample = &avst->index_entries[msc->current_sample];
+            snprintf(buffer, 1024, "%s--[%4d]%8lld", buffer, msc->current_sample, current_sample->pos);
 
-static int mov_check_stream_score(AVStream *avst, int probe_max, int *avg_size, int *avg_pos, int *score){
-    int pro_max = 0;
-    int sum_len = 0;
-    int sum_pos = 0;
-    MOVStreamContext *msc     = NULL;
-    AVIndexEntry *sample      = NULL;
-    AVIndexEntry *sample_next = NULL;
-    *avg_size = 0;
-    *score    = 0;
-    if((NULL == avst)||(NULL==avst->priv_data)){
-        return -1;
-    }
-    msc = avst->priv_data;
-    if(NULL == msc->pb){
-        return -1;
-    }
-    pro_max = avst->nb_index_entries > probe_max?probe_max:avst->nb_index_entries;
-    for(int i = 0; i < pro_max-1; i++){
-        sample = &avst->index_entries[i];
-        sum_len += sample->size;
-        sum_pos += sample->pos;
-        sample_next = &avst->index_entries[i+1];
-        if((sample->pos + sample->size) == sample_next->pos){
-            (*score) += 1;
-        }
-    }
-    *avg_size = sum_len/pro_max;
-    *avg_pos  = sum_pos/pro_max;
-    return 0;
-}
-
-static int mov_check_read_policy(AVFormatContext *s){
-    const int MAX_STREAM_SCORE = 50;
-    int index, avg_len;
-    int score_air, score_video, score_audio;
-    int avg_pos, avg_pos_video, avg_pos_audio;
-
-    MOVContext *mov = s->priv_data; 
-    if(mov->read_packet_policy != READ_POLICY_UNKOWN){
-        return mov->read_packet_policy;
-    }
-
-    const char* videouri = s->filename;
-    if(NULL == videouri){
-        mov->read_packet_policy = READ_POLICY_DEFAULT;
-        return mov->read_packet_policy;
-    }
-    av_log(NULL, AV_LOG_ERROR, "MOV -->  mov_check_read_policy --> videouri =%.32s", videouri);    
-    if(NULL==strstr(videouri,"http:")){
-        mov->read_packet_policy = READ_POLICY_DEFAULT;
-        return READ_POLICY_DEFAULT;
-
-    }
-    if((NULL!=strstr(videouri,".com"))||(NULL!=strstr(videouri,".COM"))){
-        mov->read_packet_policy = READ_POLICY_DEFAULT;
-        return mov->read_packet_policy;
-    }
-/*
-    URLContext *urictx =  (URLContext *)s->pb->opaque;
-    if((NULL != urictx)&&(strcmp("http", urictx->prot->name)!=0)){
-        mov->read_packet_policy = READ_POLICY_DEFAULT;
-        return READ_POLICY_DEFAULT;
-    }
-*/
-
-    score_air = score_video   = score_audio   = 0;
-    avg_pos   = avg_pos_video = avg_pos_audio = 0;
-    mov->read_packet_policy = READ_POLICY_DEFAULT;
-    mov->stream_index_audio = -1;
-    mov->stream_index_video = -1;
-    for (index = 0; index < s->nb_streams; index++) {
-        AVStream *st = s->streams[index];
-        mov_check_stream_score(st, MAX_STREAM_SCORE, &avg_len, &avg_pos, &score_air);
-        av_log(NULL, AV_LOG_ERROR, "MOV -->  mov_check_read_policy --> stream[%d]  type=%d; score_air=%d", 
-                                        index, st->codec->codec_type, score_air);
-        
-        if((st->codec->codec_type == AVMEDIA_TYPE_VIDEO)&&(-1==mov->stream_index_video)){
-            mov->stream_index_video=index;
-            score_video = score_air;
-            avg_pos_video = avg_pos;
-        }
-        
-        if((st->codec->codec_type == AVMEDIA_TYPE_AUDIO)&&(-1==mov->stream_index_audio)){
-            mov->stream_index_audio=index;
-            score_audio = score_air;
-            avg_pos_audio = avg_pos;
-        }
-    }
-
-    if((-1==mov->stream_index_audio)||(-1 == mov->stream_index_video)){
-        av_log(NULL, AV_LOG_ERROR, 
-            "MOV -->  mov_check_read_policy --> Has no Video or Audio Stream; USE READ_POLICY_DEFAULT");
-        mov->read_packet_policy = READ_POLICY_DEFAULT;
-        return mov->read_packet_policy;
-    }
-
-    av_log(NULL, AV_LOG_ERROR, "MOV -->  mov_check_read_policy -->distance_av=%d ", abs(avg_pos_video-avg_pos_audio));
-    if(abs(avg_pos_video-avg_pos_audio)<1*1024*1024){
-        av_log(NULL, AV_LOG_ERROR, 
-            "MOV -->  mov_check_read_policy --> abs(avg_pos_video-avg_pos_audio)=%d",abs(avg_pos_video-avg_pos_audio));
-        av_log(NULL, AV_LOG_ERROR, 
-            "MOV -->  mov_check_read_policy --> Video is near Audio; USE READ_POLICY_DEFAULT");
-        mov->read_packet_policy = READ_POLICY_DEFAULT;
-        return mov->read_packet_policy;
-    }
-
-    score_air = score_audio+score_video;
-    av_log(NULL, AV_LOG_ERROR, "MOV -->  mov_check_read_policy -->score_air=%d ", score_air);
-    if(score_air >= (MAX_STREAM_SCORE + MAX_STREAM_SCORE/2)){
-        int video_entries = s->streams[mov->stream_index_video]->nb_index_entries;
-        int audio_entries = s->streams[mov->stream_index_audio]->nb_index_entries;
-        mov->chunk_distance_video = (video_entries*10.0f/audio_entries);
-        mov->chunk_distance_audio = 10.0f;
-        mov->chunk_index_video = 0;
-        mov->chunk_index_audio = 3;
-        mov->read_packet_policy = READ_POLICY_AIR;
-    }
-
-    return mov->read_packet_policy;
-
-}
-
-static AVIndexEntry *mov_find_next_sample_special(AVFormatContext *s, AVStream **st){
-    AVIndexEntry *sample_video,*sample_audio;
-    int64_t pack_time_video,pack_time_audio;
-    AVStream *stream = NULL;
-    MOVStreamContext *mov_context = NULL;
-    int index = 0;
-    MOVContext *mov = s->priv_data;
-    if((mov->stream_index_video==-1)||(mov->stream_index_audio==-1)){
-        av_log(NULL, AV_LOG_ERROR, "mov_find_next_sample_special --> NO AV StreamTrack...");
-        return NULL;
-    }
-
-    int index_max_video = (int)(mov->chunk_distance_video*mov->chunk_index_video);
-    int index_max_audio = (int)(mov->chunk_distance_audio*mov->chunk_index_audio);
-    sample_video    = sample_audio    = NULL;
-    pack_time_video = pack_time_audio = 0 ;
-    
-    stream      = s->streams[mov->stream_index_video];
-    mov_context = stream->priv_data;
-    if(mov_context->pb && (mov_context->current_sample < stream->nb_index_entries)
-                           &&(mov_context->current_sample<=index_max_video)){
-        sample_video = &stream->index_entries[mov_context->current_sample];
-        if(mov_context->current_sample==index_max_video){
-            mov->chunk_index_audio++;
-            for (index = 0; index < s->nb_streams; index++) {
-                if(s->streams[index]->codec->codec_type==AVMEDIA_TYPE_AUDIO){
-                    mov->stream_index_audio = index;
-                    break;
-                }
+            //find best sample(smallest position) in all stream
+            if((NULL != current_sample) && (current_sample->pos < best_pos)){
+                best_pos = current_sample->pos;
+                sample = current_sample;
+                *st = avst;
             }
         }
-        *st = stream;
-        return sample_video;
+    }
+    if(NULL != sample){
+        snprintf(buffer, 1024, "%s   selected:%8lld", buffer, sample->pos);
+        //av_log(s, AV_LOG_ERROR, "mov_find_next_sample_special %s", buffer);
     }
 
-
-
-    stream = s->streams[mov->stream_index_audio];    
-    mov_context = stream->priv_data;
-    if(mov_context->pb && (mov_context->current_sample < stream->nb_index_entries)
-                       &&(mov_context->current_sample<=index_max_audio)){
-        sample_audio = &stream->index_entries[mov_context->current_sample];
-        if(mov_context->current_sample == index_max_audio){
-            int new_index = mov->stream_index_audio;
-            for (index = 0; index < s->nb_streams; index++) {
-                if(s->streams[index]->codec->codec_type==AVMEDIA_TYPE_AUDIO){
-                    if(index > new_index){
-                        new_index = index;
-                        break;
-                    }
-                }
-            }
-            if(new_index==mov->stream_index_audio){              
-                mov->chunk_index_video++;
-            }else{
-                mov->stream_index_audio = new_index;
-            }
-            
-        }
-        *st = stream;
-        return sample_audio;
-    }
-
-    return NULL;
+    return sample;
 }
+
 
 static AVIndexEntry *mov_find_next_sample(AVFormatContext *s, AVStream **st)
 {
-    switch(mov_check_read_policy(s)){
-        case READ_POLICY_AIR:
-            return mov_find_next_sample_special(s, st);
-        default:
-            break;
+    if(NULL != s){
+        //return mov_find_next_sample_special(s, st);
     }
+
     AVIndexEntry *sample = NULL;
     int64_t best_dts = INT64_MAX;
     int i;
@@ -3493,8 +3376,14 @@ static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
     /* must be done just before reading, to avoid infinite loop on sample */
     sc->current_sample++;
 
+    AVIOContext *pb = sc->pb;
+    if ((st->codec->codec_type == AVMEDIA_TYPE_AUDIO)||(st->codec->codec_type == AVMEDIA_TYPE_SUBTITLE)) {
+        if(NULL != sc->pb_slave){
+            pb = sc->pb_slave;
+        }
+    }
     if (st->discard != AVDISCARD_ALL) {
-        if (avio_seek(sc->pb, sample->pos, SEEK_SET) != sample->pos) {
+        if (avio_seek(pb, sample->pos, SEEK_SET) != sample->pos) {
             av_log(mov->fc, AV_LOG_ERROR, "stream %d, offset 0x%"PRIx64": partial file\n",
                    sc->ffindex, sample->pos);
 			
@@ -3505,7 +3394,7 @@ static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
            goto retry;		
            //return AVERROR_INVALIDDATA;
         }
-        ret = av_get_packet(sc->pb, pkt, sample->size);
+        ret = av_get_packet(pb, pkt, sample->size);
         if (ret < 0)
             return ret;
         if (sc->has_palette) {

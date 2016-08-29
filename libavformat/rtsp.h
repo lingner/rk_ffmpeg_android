@@ -218,18 +218,31 @@ enum Fec_type{
 #endif
 
 typedef struct RTPCacheContext {
-    pthread_t tid;
-    int thread_status;
+    pthread_t read_pid;
+    pthread_t fec_process_pid;
+    int read_packet_thread;
+    int fec_process_thread;
     int working;
     int fec_status;
     int queue_len_av;
     int queue_len_fec;
+    int queue_len_process_av;
     int type;
 
     int64_t av_queue_datasize;
     int64_t fec_queue_datasize;
+
+    /*
+    * 未进行fec处理前的音视频和fec缓冲队列
+    */
     RTPPacket *queue_av;
     RTPPacket *queue_fec;
+
+    /*
+    * 进行fec包恢复之后的音视频队列
+    */
+    RTPPacket* av_process_header;
+    RTPPacket* av_process_tail;
     uint8_t * recv_buff;
     
     int fec_seq_start;
@@ -438,6 +451,15 @@ typedef struct RTSPState {
     int rtcp_flag;
 
     RTPCacheContext *rtp_cache_ctx;
+
+    /*
+    * sync the fec's read thread,ff_rtsp_fetch_packet(in readPacket thread) and rtp/rtsp reconnect opearation
+    */
+    pthread_mutex_t     mRWLock;
+
+    int64_t     reconnect_time;
+
+    int         isReconnect;
 } RTSPState;
 
 #define RTSP_FLAG_FILTER_SRC  0x1    /**< Filter incoming UDP packets -
@@ -644,6 +666,7 @@ int ff_rtsp_getnameinfo(const struct sockaddr *sa, int salen,
 int ff_rtsp_open_transport_ctx(AVFormatContext *s, RTSPStream *rtsp_st);
 int ff_rtsp_fec_core_process(AVFormatContext *s);
 int rtp_udp_print_packet(RTPDemuxContext *s, const char *buf);
+void* fec_process_thread(void *fctx);
 void* rtp_cache_thread(void *fctx);
 
 extern const AVOption ff_rtsp_options[];

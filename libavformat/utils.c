@@ -304,6 +304,10 @@ AVInputFormat *av_probe_input_format3(AVProbeData *pd, int is_opened, int *score
     AVProbeData lpd = *pd;
     AVInputFormat *fmt1 = NULL, *fmt;
     int score, nodat = 0, score_max=0;
+    const static uint8_t zerobuffer[AVPROBE_PADDING_SIZE] = {0};
+
+    if (!lpd.buf)
+        lpd.buf = zerobuffer;
 
     if (lpd.buf_size > 10 && ff_id3v2_match(lpd.buf, ID3v2_DEFAULT_MAGIC)) {
         int id3len = ff_id3v2_tag_len(lpd.buf);
@@ -598,13 +602,61 @@ void avformat_queue_attached_pictures(AVFormatContext *s)
         }
 }
 
+static void avformat_record_file(AVFormatContext *s)
+{
+    if (s->ts_debug_flag != 1) {
+        return;
+    }
+
+    if (!strcmp(s->iformat->name, "mpegts") || !strcmp(s->iformat->name, "hls,applehttp")) {
+        return;// record by mpegts.c
+    }
+    
+    av_log(NULL, AV_LOG_ERROR, "%s: record raw data, format: %s", __FUNCTION__, s->iformat->name);
+    const int read_size = 4096;
+    unsigned char rbuf[4096];
+    int64_t old_offset = avio_tell(s->pb);
+    int ret = avio_seek(s->pb, 0, SEEK_SET);
+    if (ret < 0) {
+        av_log(NULL, AV_LOG_ERROR, "%s: record raw data failed (seek 0 err)", __FUNCTION__);
+        return;
+    }
+
+    FILE *file = fopen("/data/test.raw","wr+");
+    if (!file) {
+        av_log(NULL, AV_LOG_ERROR, "%s: record raw data failed (create file fail)", __FUNCTION__);
+        return;
+    }
+
+    int64_t max_read_size = 15*1024*1024;
+    int64_t total_read_size = 0;
+    while (total_read_size < max_read_size) {
+        ret = avio_read(s->pb, rbuf, read_size);
+        if (ret <= 0) {
+            break; 
+        } else {
+            fwrite(rbuf, 1, ret, file);
+            fflush(file);
+            total_read_size += ret;
+        }
+
+        if (ff_check_interrupt(&(s->interrupt_callback))) {
+            break;
+        }
+    }
+    fclose(file);
+    avio_seek(s->pb, old_offset, SEEK_SET);
+    av_log(NULL, AV_LOG_ERROR, "%s: record raw data ok, read_size: %lld", __FUNCTION__, total_read_size);
+        
+}
+
 int avformat_open_input(AVFormatContext **ps, const char *filename, AVInputFormat *fmt, AVDictionary **options)
 {
     AVFormatContext *s = *ps;
     int ret = 0;
     AVDictionary *tmp = NULL;
     ID3v2ExtraMeta *id3v2_extra_meta = NULL;
-    av_log(NULL,AV_LOG_ERROR,"ffmpeg version 10-26\n");
+    av_log(NULL,AV_LOG_ERROR,"ffmpeg version v2.0 16-08-18\n");
     if (!s && !(s = avformat_alloc_context()))
         return AVERROR(ENOMEM);
     if (!s->av_class){
@@ -683,7 +735,6 @@ int avformat_open_input(AVFormatContext **ps, const char *filename, AVInputForma
         *options = tmp;
     }
     *ps = s;
-
     return 0;
 
 fail:
@@ -1400,15 +1451,20 @@ static int read_frame_internal(AVFormatContext *s, AVPacket *pkt)
                 st->parser->flags |= PARSER_FLAG_USE_CODEC_TS;
             }
             
-            if(st->parser != NULL)
-	    {
-		av_parser_init_callback(st->parser,
-			s->interrupt_callback.callback,
-			s->interrupt_callback.msg_callback,
-			s->interrupt_callback.operate_callback,
-			s->interrupt_callback.opaque,
-			s->interrupt_callback.msg_opaque,
-			s->interrupt_callback.operate_opaque);
+            if(st->parser != NULL) {
+        		av_parser_init_callback(st->parser,
+        			s->interrupt_callback.callback,
+        			s->interrupt_callback.msg_callback,
+        			s->interrupt_callback.operate_callback,
+        			s->interrupt_callback.opaque,
+        			s->interrupt_callback.msg_opaque,
+        			s->interrupt_callback.operate_opaque);
+            }
+
+            if (st->parser != NULL && st->codec->codec_id == AV_CODEC_ID_H264
+                && s->mIPTVControlProbe > 0) {
+                st->parser->flags |= PARSER_FLAG_USE_SPLIT_SPS;
+                av_log(s, AV_LOG_ERROR, "iptv parser init with split sps mode!");
             }
         }
 
@@ -1423,7 +1479,7 @@ static int read_frame_internal(AVFormatContext *s, AVPacket *pkt)
             }
             got_packet = 1;
         } else if (st->discard < AVDISCARD_ALL) {
-            if ((ret = parse_packet(s, &cur_pkt, cur_pkt.stream_index)) < 0)
+            if ((ret = parse_packet(s, &cur_pkt, cur_pkt.stream_index)) < 0) 
                 return ret;
         } else {
             /* free packet */
@@ -1664,7 +1720,7 @@ int av_read_frame(AVFormatContext *s, AVPacket *pkt)
 return_packet:
 
     st = s->streams[pkt->stream_index];
-	if((s->mIPTVControlProbe == 1) && st->codec && st->codec->codec_type == AVMEDIA_TYPE_AUDIO && !has_codec_parameters(st, NULL))
+	if(s->mIPTVControlProbe <= 1 && st->info && st->codec && st->codec->codec_type == AVMEDIA_TYPE_AUDIO && !has_codec_parameters(st, NULL))
 	{
 		av_log(NULL, AV_LOG_ERROR, ".......found_decoder = %d", st->info->found_decoder);
 		try_decode_frame(st, pkt, NULL, 1);
@@ -2443,6 +2499,8 @@ typedef struct RK_STREAM_INFO{
     int     change_valid_num;
 
     int     change;
+    //连续读包个数
+    int     read_check_num;
 }RK_STREAM_INFO;
 
 
@@ -2493,7 +2551,7 @@ static void scan_all_file_estimate_timings(AVFormatContext *ic, int64_t old_offs
         if(info != NULL)
         {
             info[i].start_pts = st->start_time;
-            if((info[i].start_pts == AV_NOPTS_VALUE) && (st->first_dts == AV_NOPTS_VALUE))
+            if((info[i].start_pts == AV_NOPTS_VALUE) && (st->first_dts != AV_NOPTS_VALUE))
                 info[i].start_pts = st->first_dts;
 
             
@@ -2942,6 +3000,7 @@ static int binary_estimate_timings_from_pts(AVFormatContext *ic, int64_t old_off
 
         for (i=0; i<ic->nb_streams; i++) {
             info[i].total_check_num = 0;
+            info[i].read_check_num = 0;
         }
         
         ret_seek = avio_seek(ic->pb, offset, SEEK_SET);
@@ -3042,18 +3101,24 @@ static int binary_estimate_timings_from_pts(AVFormatContext *ic, int64_t old_off
                 if (duration > 0) {
                     if (st->duration == AV_NOPTS_VALUE || st->duration < duration){
                         st->duration = duration;
+                        //av_free_packet(pkt);
+                        //break;
                     //    av_log(NULL,AV_LOG_ERROR,"st[%d].duration = %lld",pkt->stream_index,st->duration);
                     }
                 }
 
                 if(currentInfo->total_check_num > 3)
                 {
+                    av_free_packet(pkt);
                     break;
                 }
             }
             av_free_packet(pkt);
-
-          //  if(currentInfo->
+            
+            currentInfo->read_check_num++;
+            if(currentInfo->read_check_num > 15) {
+                break;
+            }
         }
 		// if cannot find sync bite
         if(end_time == AV_NOPTS_VALUE)
@@ -3465,11 +3530,13 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
     int64_t old_offset = avio_tell(ic->pb);
     int orig_nb_streams = ic->nb_streams;        // new streams might appear, no options for those
     int flush_codecs = ic->probesize > 0;
-    int trynum = 10;
+    int trynum = 8;
+    int mp4trynum = 0;
     if(ic->pb)
         av_log(ic, AV_LOG_DEBUG, "File position before avformat_find_stream_info() is %"PRId64"\n", avio_tell(ic->pb));
     read_size = 0;   
     
+    avformat_record_file(ic);
 tryAgain:
 
     for(i=0;i<ic->nb_streams;i++) {
@@ -3550,38 +3617,82 @@ tryAgain:
             break;
         }
 
-
-     if (ic->nb_streams > 200) {
-        av_log(ic, AV_LOG_ERROR, "there are too many streams, return error.");
-        return AVERROR(EINVAL);
-     }
-     
-	 int video_find = 0;
-	 //av_log(NULL, AV_LOG_ERROR, "ic->mIPTVControlProbe = %d",ic->mIPTVControlProbe);
-	 for(i=0;i<ic->nb_streams;i++)
- 	 {
- 	    st = ic->streams[i];
-		if(has_codec_parameters_for_avformat(ic,st, NULL))
-        {
-			if(st->codec->codec_type == AVMEDIA_TYPE_VIDEO)
-			{
-				video_find  = 1;
-			}
-        	continue;
+        if (ic->nb_streams > 280) {
+            av_log(ic, AV_LOG_ERROR, "there are too many streams, return error, ic->nb_streams: %d", ic->nb_streams);
+            return AVERROR(EINVAL);
         }
-		else
-		{
-			break;
-		}
- 	 }
+     
+        int video_find = 0;
+        int av_params_find = (ic->nb_streams > 0) ? 1 : 0;
+        //av_log(NULL, AV_LOG_ERROR, "ic->mIPTVControlProbe = %d",ic->mIPTVControlProbe);
+        AVStream* video_st = NULL;
 
-	 if((i == ic->nb_streams && i > 1 && video_find == 1 && (strncmp(ic->filename, "file/fd::", 9) != 0)) 
-            || ((video_find == 1)&& ((ic->mIPTVControlProbe == 1) || (ic->mIPTVControlProbe == 2))))
-	 {
-	 	av_log(ic, AV_LOG_ERROR, "all stream has parameter ************** break");
-	 	break ;
-	 }
+        int video_track_cnt = 0;
+        for(i=0; i<ic->nb_streams; i++) {
+            st = ic->streams[i];
+            if(st->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
+                video_track_cnt++;
+            }
+        }
 
+        int strm_find_cnt = 0;
+        for(i=0; i<ic->nb_streams; i++) {
+            st = ic->streams[i];
+            if(has_codec_parameters_for_avformat(ic,st, NULL)) {
+                strm_find_cnt++;
+                if(st->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    if (video_track_cnt > 1) {
+                        AVProgram *program = av_find_program_from_stream(ic, NULL, st->index);
+                        if (program == NULL) {
+                            av_log(ic, AV_LOG_ERROR, "stream no relate with program, index: %d", st->index);
+                            continue;
+                        }
+                    }
+                    
+                    video_find = 1;
+                    video_st = st;
+                }
+            } else {
+                av_params_find = 0;
+            }
+        }
+		
+        if (strm_find_cnt == ic->nb_streams && strm_find_cnt > 1 && video_find == 1  && (strncmp(ic->filename, "file/fd::", 9) != 0)) {
+            if (strstr(ic->iformat->name, "mp4") && video_st &&
+                video_st->codec->pix_fmt == AV_PIX_FMT_NONE && 
+                video_st->codec->codec_id == AV_CODEC_ID_H264 && 
+                mp4trynum == 0) {
+                mp4trynum++;
+                av_log(ic, AV_LOG_ERROR, "mp4 has not pix_fmt waiting...");
+            } else {
+                av_log(ic, AV_LOG_ERROR, "all stream has parameter ************** break");
+                break ;
+            }
+        }
+
+        if (video_find == 1 && (ic->mIPTVControlProbe == 1 || ic->mIPTVControlProbe == 2)) {
+            int64_t t = 0;
+            if (st->codec_info_nb_frames > 1 && st->info) {
+                if (st->time_base.den > 0)
+                    t = av_rescale_q(st->info->codec_info_duration, st->time_base, AV_TIME_BASE_Q);
+                if (st->avg_frame_rate.num > 0)
+                    t = FFMAX(t, av_rescale_q(st->codec_info_nb_frames, av_inv_q(st->avg_frame_rate), AV_TIME_BASE_Q));
+            }
+
+            int max_v_read_size = 0;
+            int64_t max_v_read_time = 100 * 1000;
+            if (video_track_cnt > 1) {
+                max_v_read_size = 1 * 1024 * 1024;
+                max_v_read_time = 1 * 1000 * 1000;
+            }
+            
+            if (read_size > max_v_read_size || t > max_v_read_time) {
+                av_log(ic, AV_LOG_ERROR, "iptv base stream has parameter break, read_size: %d, t: %lld", read_size, t);
+                break ;
+            } else {
+                av_log(ic, AV_LOG_ERROR, "iptv base stream has parameter, read_size: %d, target_read_size: %d", read_size, max_v_read_size);
+            }
+        }
 	 
         /* check if one codec still needs to be handled */
         for(i=0;i<ic->nb_streams;i++) {
@@ -3638,7 +3749,7 @@ tryAgain:
                else
                {
                     av_log(NULL,AV_LOG_ERROR,"avformat_find_stream_info:add probesize");
-                        ic->probesize += (10-trynum)*1024*512;
+                        ic->probesize += (8-trynum)*1024*512;
                     goto tryAgain;
                }
            }
@@ -3714,7 +3825,20 @@ tryAgain:
             if (t >= ic->max_analyze_duration) {
                 av_log(ic, AV_LOG_ERROR, "max_analyze_duration %d reached at %"PRId64"\n", ic->max_analyze_duration, t);
                 break;
-            }
+            }else if (av_params_find == 1 && ic->mIPTVControlProbe == 1) {
+                if((ic->nb_streams == 1) && (st->codec != NULL) && (st->codec->codec_type == AVMEDIA_TYPE_AUDIO)){
+                    if(t >= 1500000){
+                        av_log(ic, AV_LOG_ERROR,"ic->nb_streams == 1: only audio stream,t >= 1500000");
+                        break;
+                    }
+                }else if(t >= FFMAX(ic->max_analyze_duration * 0.4, 3000000)){
+                    av_log(ic, AV_LOG_ERROR, "max_analyze_duration %d reached half %"PRId64", av params has found, break\n", ic->max_analyze_duration, t);
+                    break;
+                }
+            } 
+
+
+
             if (pkt->duration) {
                 st->info->codec_info_duration        += pkt->duration;
                 st->info->codec_info_duration_fields += st->parser && st->codec->ticks_per_frame==2 ? st->parser->repeat_pict + 1 : 2;
@@ -3955,8 +4079,13 @@ tryAgain:
             ic->streams[i]->codec->thread_count = 0;
         if((ic->streams[i]->info != NULL) && (ic->mIPTVControlProbe == 0))
         {
-            av_freep(&ic->streams[i]->info);
-            av_log(NULL,AV_LOG_ERROR,"%s:find_stream_info_err:free info,ok",__FUNCTION__);
+            AVStream *st = ic->streams[i];
+            if (st->codec && st->codec->codec_type == AVMEDIA_TYPE_AUDIO && !has_codec_parameters(st, NULL)) {
+                av_log(NULL,AV_LOG_ERROR,"%s:find_stream_info find audio parameters later, no free info",__FUNCTION__);
+            } else {
+                av_freep(&ic->streams[i]->info);
+                av_log(NULL,AV_LOG_ERROR,"%s:find_stream_info_err:free info,ok",__FUNCTION__);
+            }
         }
         else
         {

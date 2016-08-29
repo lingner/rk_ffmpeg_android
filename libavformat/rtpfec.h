@@ -42,4 +42,7 @@ int fec_update_range(AVFormatContext *fc, int seq_start, int seq_end, int fec_nu
 uint8_t** rtp_get_av_vector(RTSPState *rt, int* lost_map);
 uint8_t** rtp_get_fec_vector(RTSPState *rt, int* lost_map);
 uint8_t* insert_empty_pkt(RTPCacheContext* cacheCtx,int seq,int pay_load);
+int fec_reconnect(AVFormatContext *s,RTSPStream* rtsp_fec);
+int isFecPacket(int rtpContex_payload,int data_payload);
+int deleteFecPacket(RTPCacheContext *cache_ctx,int start,int end);
 #endif

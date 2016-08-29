@@ -367,6 +367,12 @@ int avio_get_str16be(AVIOContext *pb, int maxlen, char *buf, int buflen);
 #define AVIO_FLAG_NONBLOCK 8
 
 /**
+ * Rtp timeout flag
+ * If this flag is set, rtp_read can timeout, no block in rtp_read
+ */
+#define AVIO_FLAG_RTP_TIMEOUT 0x4000
+
+/**
  * Use direct mode.
  * avio_read and avio_write should if possible be satisfied directly
  * instead of going through a buffer, and avio_seek will always

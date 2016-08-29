@@ -113,6 +113,7 @@ static VLC vlc_scalefactors;
 static VLC vlc_spectral[11];
 
 #define overread_err "Input buffer exhausted before END element found\n"
+#define MAX_AAC_ERR_CHCK 3
 
 static int count_channels(uint8_t (*layout)[3], int tags)
 {
@@ -506,6 +507,7 @@ static ChannelElement *get_che(AACContext *ac, int type, int elem_id)
         if (ac->oc[1].m4ac.sbr)
             ac->oc[1].m4ac.ps = -1;
     }
+    int tags_val = 0;
     // For indexed channel configurations map the channels solely based on position.
     switch (ac->oc[1].m4ac.chan_config) {
     case 7:
@@ -533,7 +535,12 @@ static ChannelElement *get_che(AACContext *ac, int type, int elem_id)
         }
     case 3:
     case 2:
-        if (ac->tags_mapped == (ac->oc[1].m4ac.chan_config != 2) && type == TYPE_CPE) {
+        tags_val = (ac->oc[1].m4ac.chan_config != 2);
+        if (ac->aac_err_num >= MAX_AAC_ERR_CHCK && ac->oc[1].m4ac.chan_config == 3) {
+            tags_val = 0;
+        }
+        
+        if (ac->tags_mapped == tags_val && type == TYPE_CPE) {
             ac->tags_mapped++;
             return ac->tag_che_map[TYPE_CPE][elem_id] = ac->che[TYPE_CPE][0];
         } else if (ac->oc[1].m4ac.chan_config == 2) {
@@ -922,6 +929,7 @@ static av_cold int aac_decode_init(AVCodecContext *avctx)
 
     avcodec_get_frame_defaults(&ac->frame);
     avctx->coded_frame = &ac->frame;
+    ac->aac_err_num = 0;
 
     return 0;
 }
@@ -2464,6 +2472,10 @@ static int aac_decode_frame_int(AVCodecContext *avctx, void *data,
                 av_log(ac->avctx, AV_LOG_ERROR, "channel element %d.%d is not allocated\n",
                        elem_type, elem_id);
                 err = -1;
+                if (ac && ac->aac_err_num < MAX_AAC_ERR_CHCK && ac->oc[1].m4ac.chan_config == 3) {
+                    ac->aac_err_num += 1;
+                    av_log(ac->avctx, AV_LOG_ERROR, "%s: aac err, num: %d\n", __FUNCTION__, ac->aac_err_num);
+                }
                 goto fail;
             }
             samples = 1024;

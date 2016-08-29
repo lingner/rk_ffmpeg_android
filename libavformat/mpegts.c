@@ -276,15 +276,30 @@ static int discard_pid(MpegTSContext *ts, unsigned int pid)
 /**
  *  Assemble PES packets out of TS packets, and then call the "section_cb"
  *  function when they are complete.
+ * 
+ * @2016.7.20 hh@rock-chips.com
+ * 修改write_section_data传入的参数AVFormatContext-->MpegTSContext
+ * s->priv_data不一定是MpegTSContext结构,比如,对于rtp播放,s->priv_data是RTSPState
+ * 如果默认为MpegTSContext结构,并在这里操作赋值,会导致RTSPState的值发生变化,
+ * 从而影响rtp的播放。
  */
-static void write_section_data(AVFormatContext *s, MpegTSFilter *tss1,
+static void write_section_data(MpegTSContext *ts, MpegTSFilter *tss1,
                                const uint8_t *buf, int buf_size, int is_start)
 {
-    MpegTSContext *ts = s->priv_data;
+ //   MpegTSContext *ts = s->priv_data;
     MpegTSSectionFilter *tss = &tss1->u.section_filter;
     int len;
 
     if (is_start) {
+        /*
+        * section_buf分配的大小为MAX_SECTION_SIZE(4096),当大于这个值时
+        * 为了避免数组溢出,直接返回
+        */
+        if(buf_size > MAX_SECTION_SIZE){
+            av_log(NULL, AV_LOG_ERROR,"%s:buf_size = %d > 4096",__FUNCTION__,buf_size);
+            return;
+        }
+        
         memcpy(tss->section_buf, buf, buf_size);
         tss->section_index = buf_size;
         tss->section_h_size = -1;
@@ -545,7 +560,7 @@ static const StreamType ISO_types[] = {
     { 0x03, AVMEDIA_TYPE_AUDIO,        AV_CODEC_ID_MP3 },
     { 0x04, AVMEDIA_TYPE_AUDIO,        AV_CODEC_ID_MP3 },
  //   { 0x06, AVMEDIA_TYPE_AUDIO,       AV_CODEC_ID_EAC3 },
-    { 0x0f, AVMEDIA_TYPE_AUDIO,        AV_CODEC_ID_AAC },
+ //   { 0x0f, AVMEDIA_TYPE_AUDIO,        AV_CODEC_ID_AAC },
     { 0x10, AVMEDIA_TYPE_VIDEO,      AV_CODEC_ID_MPEG4 },
     /* Makito encoder sets stream type 0x11 for AAC,
      * so auto-detect LOAS/LATM instead of hardcoding it. */
@@ -687,6 +702,13 @@ static int mpegts_set_stream_info(AVStream *st, PESContext *pes,
     }
     if (st->codec->codec_id == AV_CODEC_ID_NONE)
         mpegts_find_stream_type(st, pes->stream_type, MISC_types);
+	
+    AVFormatContext* s = pes->stream;
+    if (s && s->mIPTVControlProbe > 0 ) {
+        st->tsstreampid = pes->pid;
+        ff_check_operate(&s->interrupt_callback, OPERATE_SET_STREAM_INFO, st, NULL);
+    }
+
     if (st->codec->codec_id == AV_CODEC_ID_NONE){
         st->codec->codec_id  = old_codec_id;
         st->codec->codec_type= old_codec_type;
@@ -1676,6 +1698,11 @@ static void sdt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
             if (desc_tag < 0)
                 break;
             desc_len = get8(&p, desc_list_end);
+            //add by xhr
+            //云播科技_播放过程卡住.ts 
+            //当desc_len小于0的情况下，这个for循环就会变成死循环
+            if(desc_len < 0)
+                break;
             desc_end = p + desc_len;
             if (desc_end > desc_list_end)
                 break;
@@ -1804,7 +1831,7 @@ static int handle_packet(MpegTSContext *ts, const uint8_t *packet)
                 return 0;
             if (len && cc_ok) {
                 /* write remaining section bytes */
-                write_section_data(s, tss,
+                write_section_data(ts, tss,
                                    p, len, 0);
                 /* check whether filter has been closed */
                 if (!ts->pids[pid])
@@ -1812,12 +1839,12 @@ static int handle_packet(MpegTSContext *ts, const uint8_t *packet)
             }
             p += len;
             if (p < p_end) {
-                write_section_data(s, tss,
+                write_section_data(ts, tss,
                                    p, p_end - p, 1);
             }
         } else {
             if (cc_ok) {
-                write_section_data(s, tss,
+                write_section_data(ts, tss,
                                    p, p_end - p, 0);
             }
         }
@@ -2382,8 +2409,15 @@ void ff_mpegts_parse_close(MpegTSContext *ts)
 {
     int i;
 
-    for(i=0;i<NB_PID_MAX;i++)
-        av_free(ts->pids[i]);
+    clear_programs(ts);
+    
+    for(i=0;i<NB_PID_MAX;i++) {
+        if (ts->pids[i]) {
+            mpegts_close_filter(ts, ts->pids[i]);
+            av_free(ts->pids[i]);
+        }
+    }
+    
 #ifdef FILE_DEBUG  
     av_log(NULL,AV_LOG_ERROR,"ff_mpegts_parse_close");
 
@@ -2396,7 +2430,7 @@ void ff_mpegts_parse_close(MpegTSContext *ts)
             av_log(NULL,AV_LOG_ERROR,"ff_mpegts_parse_close:fd close");
         }
     }
-#endif     
+#endif
     av_free(ts);
 }
 

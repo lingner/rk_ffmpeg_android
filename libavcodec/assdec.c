@@ -43,23 +43,23 @@ static av_cold int ass_decode_init(AVCodecContext *avctx)
 static int ass_decode_frame(AVCodecContext *avctx, void *data, int *got_sub_ptr,
                             AVPacket *avpkt)
 {
-    const char *ptr = avpkt->data;
-    int len, size = avpkt->size;
+    AVSubtitle *sub = data;
 
-    while (size > 0) {
-        int duration;
-        ASSDialog *dialog = ff_ass_split_dialog(avctx->priv_data, ptr, 0, NULL);
-        if (!dialog)
-            return AVERROR_INVALIDDATA;
-        duration = dialog->end - dialog->start;
-        len = ff_ass_add_rect(data, ptr, 0, duration, 1);
-        if (len < 0)
-            return len;
-        ptr  += len;
-        size -= len;
-    }
+    if (avpkt->size <= 0)
+        return avpkt->size;
 
-    *got_sub_ptr = avpkt->size > 0;
+    sub->rects = av_malloc(sizeof(*sub->rects));
+    if (!sub->rects)
+        return AVERROR(ENOMEM);
+    sub->rects[0] = av_mallocz(sizeof(*sub->rects[0]));
+    if (!sub->rects[0])
+        return AVERROR(ENOMEM);
+    sub->num_rects = 1;
+    sub->rects[0]->type = SUBTITLE_ASS;
+    sub->rects[0]->ass  = av_strdup(avpkt->data);
+    if (!sub->rects[0]->ass)
+        return AVERROR(ENOMEM);
+    *got_sub_ptr = 1;
     return avpkt->size;
 }
 

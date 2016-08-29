@@ -11,14 +11,6 @@
 #include "libavcodec/get_bits.h"
 #include "libavutil/mem.h"
 
-#if 0
-#include <dlfcn.h>
-#include <stdint.h>
-#include <fcntl.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#endif
 
 #define MAX_CACHE_AV_SIZE (10*1024*1024)
 #define MAX_CACHE_FEC_SIZE (512*1024)
@@ -126,6 +118,9 @@ int fec_parse_url(AVFormatContext *s,RTSPStream** rtsp){
     char proto[10];
     char path[MAX_URL_SIZE];
     int port = 0;
+    int av_port = 0;
+    int fec_rtp_port = 0;
+    char tmp[100];
 
     AVStream* st = NULL;
     
@@ -138,19 +133,20 @@ int fec_parse_url(AVFormatContext *s,RTSPStream** rtsp){
     if(target == NULL){
         return -1;
     }
-
+    
     av_url_split(proto, sizeof(proto), NULL,0,
-                 hostname, sizeof(hostname), NULL,
+                 hostname, sizeof(hostname), &av_port,
                  path, sizeof(path), s->filename);
 
     av_log(s, AV_LOG_ERROR, "%s: hostname = %s",__FUNCTION__,hostname);
     av_log(s, AV_LOG_ERROR, "%s: path = %s",__FUNCTION__,path);
     av_log(s, AV_LOG_ERROR, "%s: proto = %s",__FUNCTION__,proto);
+    av_log(s, AV_LOG_ERROR, "%s: av port = %d",__FUNCTION__,av_port);
 
     target = strstr(path,"?ChannelFECPort=");
     if(target == NULL){
          // 四川华为平台
-         port -= 1;
+         port = av_port - 1;
     }
     else{
 	 // 电信规范
@@ -166,8 +162,20 @@ int fec_parse_url(AVFormatContext *s,RTSPStream** rtsp){
     
     rtsp_fec->sdp_payload_type = FEC_PLAYLOAD;
     rtsp_fec->sdp_port = port;
+    fec_rtp_port = port+1;
 
-    ff_url_join(rtsp_fec->control_url,sizeof(rtsp_fec->control_url),proto,NULL,hostname,port,NULL);
+    // setDataSource(url =rtp://239.11.0.55:5140?ChannelFECPort=5139)
+    // 一个rtp请求，需要两个端口号:rtp和rtcp的端口号
+    // rtp端口用于接收数据，rtcp端口用于反馈接收数据的质量等
+    // rtcp端口号不设置时,默认为rtp端口号+1
+    // 不要将fec的rtp和rtcp端口号设置为同一个,设置成同一个会造成rtp端口接收fec数据丢包很严重
+    while((fec_rtp_port == av_port) || (fec_rtp_port == (av_port+1))){
+        fec_rtp_port ++;
+    }
+
+    // 设置rtcp端口号
+    snprintf(tmp,100,"?rtcpport=%d",fec_rtp_port);
+    ff_url_join(rtsp_fec->control_url,sizeof(rtsp_fec->control_url),proto,NULL,hostname,port,tmp);
     rtsp_fec->stream_index = rt->nb_rtsp_streams-1;
     av_log(NULL, AV_LOG_ERROR, "%s: FEC url = %s,stream_index = %d",__FUNCTION__,rtsp_fec->control_url,rtsp_fec->stream_index);
 
@@ -180,6 +188,50 @@ int fec_parse_url(AVFormatContext *s,RTSPStream** rtsp){
     return 0;
 }
 
+
+/*
+* fec reconnect
+*/
+int fec_reconnect(AVFormatContext *s,RTSPStream* rtsp_fec)
+{
+    int error = 0;
+    if((s == NULL) || (s->priv_data == NULL) || 
+                (rtsp_fec == NULL) || (rtsp_fec->sdp_payload_type != FEC_PLAYLOAD))
+        return -1;
+    
+    av_log(NULL,AV_LOG_ERROR,"%s",__FUNCTION__);
+    RTSPState *rt = s->priv_data;
+    RTPCacheContext* context = rt->rtp_cache_ctx;
+    if(context != NULL){
+        // reconnect
+        URLContext* urlConext = NULL;
+        if (ffurl_open(&urlConext, rtsp_fec->control_url, AVIO_FLAG_READ,
+                       &s->interrupt_callback, NULL) < 0) {
+            error = AVERROR_INVALIDDATA;
+            av_log(NULL,AV_LOG_ERROR,"%s:ffurl_open fail",__FUNCTION__);
+            if(context != NULL){
+                ffurl_close(urlConext);
+                urlConext = NULL;
+            }
+            return error;
+        }
+
+        if(rtsp_fec->rtp_handle != NULL){
+            ffurl_close(rtsp_fec->rtp_handle);
+        }
+        rtsp_fec->rtp_handle = urlConext;
+        
+        if(rtsp_fec->transport_priv != NULL)
+        {
+            RTPDemuxContext* rtpDemuxContext = (RTPDemuxContext*)rtsp_fec->transport_priv;
+            if(rtpDemuxContext != NULL)
+            {
+                rtpDemuxContext->rtp_ctx = rtsp_fec->rtp_handle;
+            }
+        }
+    }
+    return error;
+}
 
 /*
 * open fec connect
@@ -228,7 +280,11 @@ unsigned char* rtp_parse_fec_header(RTPPacket *packet, uint8_t *buf, int len){
     seq  = AV_RB16(buf + 2);
     timestamp = AV_RB32(buf + 4);
     ssrc = AV_RB32(buf + 8);   
-
+    
+    if(payload_type != FEC_PLAYLOAD){
+        av_log(NULL, AV_LOG_ERROR,"%s:payload_type = %d is not fec payload,rtp seq = %d,",__FUNCTION__,payload_type,seq);
+        return NULL;
+    }
     if (buf[0] & 0x20) {
         int padding = buf[len - 1];
         if (len >= 12 + padding)
@@ -254,14 +310,17 @@ unsigned char* rtp_parse_fec_header(RTPPacket *packet, uint8_t *buf, int len){
         buf += ext;
     }
 
+    // fec header
+ //   av_log(NULL, AV_LOG_ERROR, "0x%x,0x%x,0x%x,0x%x,0x%x,0x%x",
+ //           buf[0],buf[1],buf[2],buf[3],buf[4],buf[5]);
     packet->fec_rtp_start  = AV_RB16(buf + 0);
     packet->fec_rtp_end    = AV_RB16(buf + 2);
     packet->fec_pkt_num = buf[4];
     packet->fec_pkt_idx    = buf[5];
     packet->fec_pkt_len   = AV_RB16(buf + 6);
 
-//    av_log(NULL, AV_LOG_ERROR, "%s,*****fec_rtp_start= %d,fec_rtp_end = %d,fec_pkt_ num = %d",__FUNCTION__,
-//		packet->fec_rtp_start,packet->fec_rtp_end,packet->fec_pkt_num);
+ //   av_log(NULL, AV_LOG_ERROR, "%s,seq = %d,start= %d,end = %d,num = %d,index = %d",__FUNCTION__,
+//		seq,packet->fec_rtp_start,packet->fec_rtp_end,packet->fec_pkt_num,packet->fec_pkt_idx);
 
     // skip fec header size = 12
     len -= 12;
@@ -270,22 +329,90 @@ unsigned char* rtp_parse_fec_header(RTPPacket *packet, uint8_t *buf, int len){
     // 申请新的内存地址分配fec payload 数据
     fec_buffer = av_mallocz(len);
     if(fec_buffer != NULL){
-	 memcpy(fec_buffer,buf,len);
+        memcpy(fec_buffer,buf,len);
     }
 
     return fec_buffer;
 }
 
+int deleteFecPacket(RTPCacheContext *cache_ctx,int start,int end)
+{
+    if(cache_ctx == NULL){
+        return -1;
+    }
+
+    if(cache_ctx->queue_len_fec <= 0){
+        return -1;
+    }
+    // delete fec's packets
+    pthread_mutex_lock(&(cache_ctx->mLock));
+    RTPPacket* fec_queue = cache_ctx->queue_fec;
+    int counter = 0;// just for debug
+    while (fec_queue  != NULL){
+        if(fec_queue->fec_rtp_start != start || fec_queue->fec_rtp_end != end)
+        {
+            break;
+        }
+
+        cache_ctx->last_delete_fec_seq_end = end;
+        cache_ctx->last_delete_fec_seq_start = start;
+        cache_ctx->fec_queue_datasize -= fec_queue->len;
+
+ //       av_log(NULL, AV_LOG_ERROR, "%s  delete FEC Packet seq = %d,start  = %d,end = %d", __FUNCTION__,fec_queue->seq,cache_ctx->last_delete_fec_seq_start,cache_ctx->last_delete_fec_seq_end);
+        av_free(fec_queue->buf);
+        av_free(fec_queue);        
+
+        cache_ctx->queue_len_fec--;
+        fec_queue  = fec_queue->next;
+
+        counter ++;
+    }
+    
+    cache_ctx->queue_fec = fec_queue;
+    pthread_mutex_unlock(&(cache_ctx->mLock));
+
+    av_log(NULL, AV_LOG_ERROR, "%s  delete FEC Packet start  = %d,end = %d,counter = %d", __FUNCTION__,cache_ctx->last_delete_fec_seq_start,cache_ctx->last_delete_fec_seq_end,counter);
+    return 0;
+}
+
+int isFecPacket(int rtpContex_payload,int data_payload)
+{
+    if(rtpContex_payload == FEC_PLAYLOAD && data_payload == FEC_PLAYLOAD)
+        return 0;
+
+    return -1;
+}
+
 void rtp_cache_enqueue(RTSPState *rtsps, RTPDemuxContext *rtpctx, uint8_t *buf, int len)
 {
     if((NULL==rtsps)||(NULL==rtpctx)||(NULL==buf)){
+        if(buf != NULL){
+            av_free(buf);
+        }
         return ;
     }
     uint16_t seq = AV_RB16(buf + 2);
     RTPPacket *cur, *prev = NULL, *packet;
-
+    int payload_type = buf[1] & 0x7f;
+    int context_pay_type = rtpctx->payload_type;
+//    av_log(NULL, AV_LOG_ERROR, "%s,seq = %d,payload_type = %d ,context_pay_type = %d",__FUNCTION__,seq,payload_type,context_pay_type);
+    /*
+    * 一个rtp连接包含rtp和rtcp的两个handler,会使用到两个端口
+    * rtcp默认为rtp的端口加1
+    * rtp://239.11.0.55:5140?ChannelFECPort=5139
+    * 对于这样的url,fec打开时默认会使用5140作为rtcp的端口，因为音视频
+    * 端口也为5140，从而导致fec读取数据时能够读取到音视频的数据，
+    * 同理音视频端口上也有可能接收到fec包
+    */
+    if(context_pay_type != payload_type)
+    {
+        av_free(buf);
+        av_log(NULL, AV_LOG_ERROR,"%s,context_pay_type(%d) != payload_type(%d),free",__FUNCTION__,context_pay_type,payload_type);
+        return ;
+    }
+    
     pthread_mutex_lock(&(rtsps->rtp_cache_ctx->mLock));
-    if(rtpctx->payload_type == FEC_PLAYLOAD){
+    if(isFecPacket(rtpctx->payload_type,payload_type) == 0){
         cur = rtsps->rtp_cache_ctx->queue_fec;
     }else{
         cur = rtsps->rtp_cache_ctx->queue_av;
@@ -300,6 +427,10 @@ void rtp_cache_enqueue(RTSPState *rtsps, RTPDemuxContext *rtpctx, uint8_t *buf, 
 	     }else{
 	           break;
 	     }
+        }else if(diff == 0){
+            av_free(buf);
+            pthread_mutex_unlock(&(rtsps->rtp_cache_ctx->mLock));
+            return ;
         }
         prev = cur;
         cur = cur->next;
@@ -307,7 +438,8 @@ void rtp_cache_enqueue(RTSPState *rtsps, RTPDemuxContext *rtpctx, uint8_t *buf, 
 
     packet = av_mallocz(sizeof(*packet));
     if (!packet){
-	 pthread_mutex_unlock(&(rtsps->rtp_cache_ctx->mLock));
+        pthread_mutex_unlock(&(rtsps->rtp_cache_ctx->mLock));
+        av_free(buf);
         return;
     }
     packet->recvtime = av_gettime();
@@ -316,30 +448,31 @@ void rtp_cache_enqueue(RTSPState *rtsps, RTPDemuxContext *rtpctx, uint8_t *buf, 
     packet->buf = buf;
     packet->next = cur;
 
-    if(rtpctx->payload_type == FEC_PLAYLOAD){
-         unsigned char* fec_playload_buffer = rtp_parse_fec_header(packet,buf,len);
-	  if(fec_playload_buffer != NULL){
-	  	packet->buf = fec_playload_buffer;
-		av_free(buf);
-	  }
-         rtsps->rtp_cache_ctx->queue_len_fec++;
-	  rtsps->rtp_cache_ctx->fec_queue_datasize += len;
+ //   av_log(NULL, AV_LOG_ERROR, "%s,seq = %d,payload_type = %d ,rtpctx->payload_type = %d",__FUNCTION__,seq,payload_type,rtpctx->payload_type);
+    if(isFecPacket(rtpctx->payload_type,payload_type) == 0){
+        unsigned char* fec_playload_buffer = rtp_parse_fec_header(packet,buf,len);
+        if(fec_playload_buffer != NULL){
+        	packet->buf = fec_playload_buffer;
+            av_free(buf);
+        }
+        rtsps->rtp_cache_ctx->queue_len_fec++;
+        rtsps->rtp_cache_ctx->fec_queue_datasize += len;
 //	  av_log(NULL, AV_LOG_ERROR, "%s,enque FEC packet,seq = %d,packet->buf = %p",__FUNCTION__,seq,packet->buf);
     }else{
-         rtsps->rtp_cache_ctx->queue_len_av++;
-	  rtsps->rtp_cache_ctx->av_queue_datasize += len;
+        rtsps->rtp_cache_ctx->queue_len_av++;
+        rtsps->rtp_cache_ctx->av_queue_datasize += len;
 //	  av_log(NULL, AV_LOG_ERROR, "%s,enque AV packet,seq = %d,size = %d,%p",__FUNCTION__,seq,rtsps->rtp_cache_ctx->queue_len_av,rtsps->rtp_cache_ctx->queue_av);
     }
 
     // 插入排序
     if (prev){
-	 if(rtpctx->payload_type == FEC_PLAYLOAD){
-//	      av_log(NULL, AV_LOG_ERROR,"%s: enque fec ,prev->seq = %d,%p",__FUNCTION__,seq,rtsps->rtp_cache_ctx->queue_fec);
+        if(isFecPacket(rtpctx->payload_type,payload_type) == 0){
+ //           av_log(NULL, AV_LOG_ERROR,"%s: enque fec ,prev->seq = %d,%p",__FUNCTION__,prev->seq,rtsps->rtp_cache_ctx->queue_fec);
         }
-	 prev->next = packet;
+        prev->next = packet;
     }
     else{
-        if(rtpctx->payload_type == FEC_PLAYLOAD){
+        if(isFecPacket(rtpctx->payload_type,payload_type) == 0){
 //	      av_log(NULL, AV_LOG_ERROR,"%s: enque fec to queue_fec,%p",__FUNCTION__,rtsps->rtp_cache_ctx->queue_fec);
             rtsps->rtp_cache_ctx->queue_fec = packet;
         }else{
@@ -350,33 +483,37 @@ void rtp_cache_enqueue(RTSPState *rtsps, RTPDemuxContext *rtpctx, uint8_t *buf, 
     /* 防止缓冲数据过多
     * 缓冲数据过多时，删除队列的第一个包
     */
-    if(rtpctx->payload_type == FEC_PLAYLOAD){
+    if(isFecPacket(rtpctx->payload_type,payload_type) == 0){
         if(rtsps->rtp_cache_ctx->fec_queue_datasize > MAX_CACHE_FEC_SIZE){
-	      // delete the first one
-	      cur = rtsps->rtp_cache_ctx->queue_fec;
-	      if(cur != NULL){
-	      	    packet = cur->next;
-		    av_log(NULL, AV_LOG_ERROR, "%s,cache fec too much,delete one packet seq = %d",__FUNCTION__,cur->seq);
-		    rtsps->rtp_cache_ctx->queue_fec= packet;
-		    rtsps->rtp_cache_ctx->fec_queue_datasize  -= cur->len;
-		    av_free(cur->buf);
-		    cur->buf = NULL;
-		    av_free(cur);
-	      }
+            // delete the first one
+            cur = rtsps->rtp_cache_ctx->queue_fec;
+            if(cur != NULL){
+                packet = cur->next;
+                av_log(NULL, AV_LOG_ERROR, "%s,cache fec too much,delete one packet seq = %d,length = %lld,number = %d",
+                    __FUNCTION__,cur->seq,rtsps->rtp_cache_ctx->fec_queue_datasize,rtsps->rtp_cache_ctx->queue_len_fec);
+                rtsps->rtp_cache_ctx->queue_fec= packet;
+                rtsps->rtp_cache_ctx->fec_queue_datasize  -= cur->len;
+                rtsps->rtp_cache_ctx->queue_len_fec --;
+                av_free(cur->buf);
+                cur->buf = NULL;
+                av_free(cur);
+            }
         }
     }else{
         if(rtsps->rtp_cache_ctx->av_queue_datasize > MAX_CACHE_AV_SIZE){
-	      // delete the first one
-	      cur = rtsps->rtp_cache_ctx->queue_av;
-	      if(cur != NULL){
-	      	    packet = cur->next;
-		    av_log(NULL, AV_LOG_ERROR, "%s,cache av too much,delete one packet seq = %d",__FUNCTION__,cur->seq);
-		    rtsps->rtp_cache_ctx->queue_av = packet;
-		    rtsps->rtp_cache_ctx->av_queue_datasize -= cur->len;
-		    av_free(cur->buf);
-		    cur->buf = NULL;
-		    av_free(cur);
-	      }
+            // delete the first one
+            cur = rtsps->rtp_cache_ctx->queue_av;
+            if(cur != NULL){
+                packet = cur->next;
+                av_log(NULL, AV_LOG_ERROR, "%s,cache av too much,delete one packet seq = %d,length = %lld,number = %d",
+                    __FUNCTION__,cur->seq,rtsps->rtp_cache_ctx->av_queue_datasize,rtsps->rtp_cache_ctx->queue_len_av);
+                rtsps->rtp_cache_ctx->queue_av = packet;
+                rtsps->rtp_cache_ctx->av_queue_datasize -= cur->len;
+                rtsps->rtp_cache_ctx->queue_len_av --;
+                av_free(cur->buf);
+                cur->buf = NULL;
+                av_free(cur);
+            }
         }
     }    
 #endif	
@@ -441,9 +578,9 @@ uint8_t* insert_empty_pkt(RTPCacheContext* cacheCtx,int seq, int pay_load){
     RTPPacket * prev = NULL;
     RTPPacket * empty = NULL;
     int len = 0;
-    
+
     if(cacheCtx == NULL){
-	 return NULL;
+        return NULL;
     }
      
     pthread_mutex_lock(&(cacheCtx->mLock));
@@ -459,11 +596,11 @@ uint8_t* insert_empty_pkt(RTPCacheContext* cacheCtx,int seq, int pay_load){
     while (cur) {
         int16_t diff = seq - cur->seq;
         if (diff < 0){
-	     if(diff < -1000){
-		   // rtp seq revert,insert to back
-	     }else{
-	           break;
-	     }
+            if(diff < -1000){
+            // rtp seq revert,insert to back
+            }else{
+               break;
+            }
         }
         prev = cur;
         cur = cur->next;
@@ -471,18 +608,18 @@ uint8_t* insert_empty_pkt(RTPCacheContext* cacheCtx,int seq, int pay_load){
 
     len = cacheCtx->fec_pkt_len;
     if(len == 0){
-	 if(cur){
-	     len = cur->len;
-	 }else if(prev){
-	     len = prev->len;
-	 }else{
-	     len = EMPTY_BUF_SIZE;
-	 }
+        if(cur){
+            len = cur->len;
+        }else if(prev){
+            len = prev->len;
+        }else{
+            len = EMPTY_BUF_SIZE;
+        }
     }
-    
+
     empty = av_mallocz(sizeof(RTPPacket));
     if (!empty){
-	 pthread_mutex_unlock(&(cacheCtx->mLock));
+        pthread_mutex_unlock(&(cacheCtx->mLock));
         return NULL;
     }
     empty->recvtime = av_gettime();
@@ -492,39 +629,39 @@ uint8_t* insert_empty_pkt(RTPCacheContext* cacheCtx,int seq, int pay_load){
     empty->next = cur;
     empty->insert = 1;
     if (prev){
-	 if(pay_load == FEC_PLAYLOAD){
-	 	empty->fec_rtp_start = prev->fec_rtp_start;
-		empty->fec_rtp_end = prev->fec_rtp_end;
-	 	av_log(NULL,AV_LOG_ERROR,"%s, prev->seq = %d,buf address = %p",__FUNCTION__,prev->seq,empty->buf);  
-	 }
+        if(pay_load == FEC_PLAYLOAD){
+            empty->fec_rtp_start = prev->fec_rtp_start;
+            empty->fec_rtp_end = prev->fec_rtp_end;
+    //        av_log(NULL,AV_LOG_ERROR,"%s, prev->seq = %d,buf address = %p",__FUNCTION__,prev->seq,empty->buf);  
+        }
+        
         prev->next = empty;
     }
     else{
-	if(pay_load == FEC_PLAYLOAD)
-	{
-		if(cur != NULL){
-			empty->fec_rtp_start = cur->fec_rtp_start;
-			empty->fec_rtp_end = cur->fec_rtp_end;
-		}
-		cacheCtx->queue_fec = empty;
-	       av_log(NULL,AV_LOG_ERROR,"%s, insert empty fec  %p",__FUNCTION__,empty);  
-	}
-	else
-	{
-	//       av_log(NULL,AV_LOG_ERROR,"%s, insert head ,buf address = %p",__FUNCTION__,empty->buf); 
-		cacheCtx->queue_av= empty;
-	}
+    	if(pay_load == FEC_PLAYLOAD)
+    	{
+    		if(cur != NULL){
+    			empty->fec_rtp_start = cur->fec_rtp_start;
+    			empty->fec_rtp_end = cur->fec_rtp_end;
+    		}
+            cacheCtx->queue_fec = empty;
+   //         av_log(NULL,AV_LOG_ERROR,"%s, insert empty fec  %p",__FUNCTION__,empty);  
+    	}
+    	else
+    	{
+    	//       av_log(NULL,AV_LOG_ERROR,"%s, insert head ,buf address = %p",__FUNCTION__,empty->buf); 
+            cacheCtx->queue_av= empty;
+    	}
     }
 
     if(pay_load == FEC_PLAYLOAD){
-	  cacheCtx->queue_len_fec++;
-		cacheCtx->fec_queue_datasize += len;
+        cacheCtx->queue_len_fec++;
+        cacheCtx->fec_queue_datasize += len;
      }else{
-         cacheCtx->queue_len_av++;
-	  cacheCtx->av_queue_datasize += len;
+        cacheCtx->queue_len_av++;
+        cacheCtx->av_queue_datasize += len;
     }
 	
-    
     pthread_mutex_unlock(&(cacheCtx->mLock));
     return empty->buf;
 }
@@ -577,25 +714,25 @@ uint8_t** rtp_get_av_vector(RTSPState *rt, int* lost_map){
     RTPPacket* pkt = cctx->queue_av;
     do{
         if(NULL != pkt){
-	     if(cctx->fec_seq_end > cctx->fec_seq_start){
-		  idx = pkt->seq - cctx->fec_seq_start;
-	     }else {
-	     	  if(pkt->seq >= cctx->fec_seq_start){
-	             idx = pkt->seq - cctx->fec_seq_start;
-	          }else if(pkt->seq < cctx->fec_seq_start){
-	             idx = 65535 - cctx->fec_seq_start + pkt->seq+1;
- 	         }
-	     }
-            
+            if(cctx->fec_seq_end > cctx->fec_seq_start){
+                idx = pkt->seq - cctx->fec_seq_start;
+            }else {
+                if(pkt->seq >= cctx->fec_seq_start){
+                    idx = pkt->seq - cctx->fec_seq_start;
+                }else if(pkt->seq < cctx->fec_seq_start){
+                    idx = 65535 - cctx->fec_seq_start + pkt->seq+1;
+                }
+            }
+
             if((idx>=0)&&(idx<pack_num)){
                 //only saving pointer to vector
                 pack_vector[idx] = pkt->buf;
                 lost_map[idx]=1;
-		  		counter ++;
+                counter ++;
             }
-             
+
             if(idx>=pack_num){
-		   		break;
+                break;
             }
         }
         pkt = pkt->next;
@@ -604,26 +741,29 @@ uint8_t** rtp_get_av_vector(RTSPState *rt, int* lost_map){
     pkt = cctx->queue_av; 
  //   av_log(NULL,AV_LOG_ERROR,"start = %d,end = %d",cctx->fec_seq_start,cctx->fec_seq_end);
     if(cctx->fec_seq_end > cctx->fec_seq_start){
-	 for(i = cctx->fec_seq_start; i  <= cctx->fec_seq_end ; i++){
-	// 	av_log(NULL,AV_LOG_ERROR,"lost_map[%d] == %d",i-cctx->fec_seq_start,lost_map[i-cctx->fec_seq_start]);
-	       if(lost_map[i-cctx->fec_seq_start] == 0){
-		    pack_vector[i-cctx->fec_seq_start] = insert_empty_pkt(cctx,i,0);
-	       }
-	 }
+        for(i = cctx->fec_seq_start; i  <= cctx->fec_seq_end ; i++){
+            // 	av_log(NULL,AV_LOG_ERROR,"lost_map[%d] == %d",i-cctx->fec_seq_start,lost_map[i-cctx->fec_seq_start]);
+            if(lost_map[i-cctx->fec_seq_start] == 0){
+                av_log(NULL,AV_LOG_ERROR,"av packet lost seq = %d",i);
+                pack_vector[i-cctx->fec_seq_start] = insert_empty_pkt(cctx,i,0);
+            }
+        }
     }else{
-	 for(i = cctx->fec_seq_start; i <= 65535; i++){
-	 	idx = i-cctx->fec_seq_start;
-	 	if(lost_map[idx] == 0){
-		    pack_vector[idx] = insert_empty_pkt(cctx,i,0);
-	       }
-	 }
+        for(i = cctx->fec_seq_start; i <= 65535; i++){
+            idx = i-cctx->fec_seq_start;
+            if(lost_map[idx] == 0){
+                av_log(NULL,AV_LOG_ERROR,"av packet lost seq = %d",i);
+                pack_vector[idx] = insert_empty_pkt(cctx,i,0);
+            }
+        }
 
-	 for(i = 0; i <= cctx->fec_seq_end; i++){
-	 	idx = 65535 - cctx->fec_seq_start+i+1;
-	 	if(lost_map[idx] == 0){
-		    pack_vector[idx] = insert_empty_pkt(cctx,i,0);
-	       }
-	 }
+        for(i = 0; i <= cctx->fec_seq_end; i++){
+            idx = 65535 - cctx->fec_seq_start+i+1;
+            if(lost_map[idx] == 0){
+                av_log(NULL,AV_LOG_ERROR,"av packet lost seq = %d",i);
+                pack_vector[idx] = insert_empty_pkt(cctx,i,0);
+            }
+        }
     }
 
     return pack_vector;
@@ -670,14 +810,18 @@ uint8_t** rtp_get_fec_vector(RTSPState *rt, int* lost_map){
     }
     else
     {
-	idx_base = 65535 - cctx->fec_seq_start + cctx->fec_seq_end + 2;
+    	idx_base = 65535 - cctx->fec_seq_start + cctx->fec_seq_end + 2;
     }
  //   av_log(NULL,AV_LOG_ERROR,"%s idx_base = %d", __FUNCTION__, idx_base);  
     RTPPacket* pkt = cctx->queue_fec;
+    if(pkt != NULL){
+        av_log(NULL,AV_LOG_ERROR,"%s,seq = %d,start = %d,end = %d,number = %d",
+            __FUNCTION__,pkt->seq,cctx->fec_seq_start,cctx->fec_seq_end,cctx->fec_pkt_num);
+    }
     do{
         if(NULL != pkt){
             idx = pkt->fec_pkt_idx;
-	     if(idx_old > idx){break;}
+            if(idx_old > idx){break;}
             if((idx>=0)&&(idx<pkt_num)){
                 //only saving pointer to vector
                 pack_vector[idx] = pkt->buf;
@@ -694,17 +838,18 @@ uint8_t** rtp_get_fec_vector(RTSPState *rt, int* lost_map){
     int cur_seq = pkt->seq;
     int cur_index = pkt->fec_pkt_idx;
     for(int i = 0; i  < pkt_num ; i++){
-         if(lost_map[idx_base+i] == 0){
-             int seq = cur_seq - cur_index +i;
-	      if(seq > 65535)
-		{
+        if(lost_map[idx_base+i] == 0){
+            int seq = cur_seq - cur_index +i;
+            if(seq > 65535)
+            {
                  seq = seq - 65535 - 1;
-		}else if(seq < 0){
-		    seq += 65535 + 1;
-		}
-	       pack_vector[i] = insert_empty_pkt(cctx,seq, FEC_PLAYLOAD);
-       }
-     }
+            }else if(seq < 0){
+                seq += 65535 + 1;
+            }
+            av_log(NULL,AV_LOG_ERROR,"fec packet lost seq = %d",seq);
+            pack_vector[i] = insert_empty_pkt(cctx,seq, FEC_PLAYLOAD);
+        }
+    }
 
     return pack_vector;
 }
@@ -712,56 +857,80 @@ uint8_t** rtp_get_fec_vector(RTSPState *rt, int* lost_map){
 int init_fec(RTPCacheContext** fec_context){
     RTPCacheContext*context = (RTPCacheContext*)av_mallocz(sizeof(RTPCacheContext));
     if(context!= NULL){
-         pthread_mutex_init(&(context->mLock), NULL);
-	  *fec_context = context;
+        pthread_mutex_init(&(context->mLock), NULL);
+        context->read_packet_thread = -1;
+        context->fec_process_thread = -1;
+        context->working=1;
+        *fec_context = context;
 
-	  return 1;
+        return 1;
     }
     return -1;
 }
 
 void fec_close(RTPCacheContext* context){
     RTPPacket* cur = NULL;
-    context->working = 1;
+    context->working = 0;
     av_log(NULL,AV_LOG_ERROR,"%s ", __FUNCTION__);
-    if(context->thread_status >= 0){
+    if(context->read_packet_thread >= 0){
 	 av_log(NULL,AV_LOG_ERROR,"%s join thread", __FUNCTION__);
-        if (pthread_join(context->tid, NULL) != 0) {
+        if (pthread_join(context->read_pid, NULL) != 0) {
             av_log(NULL, AV_LOG_ERROR, "%s",__FUNCTION__);
         }
-        context->thread_status = -1;
+        context->read_packet_thread = -1;
     }
+
+    if(context->fec_process_thread >= 0){
+        av_log(NULL,AV_LOG_ERROR,"%s join thread", __FUNCTION__);
+        if (pthread_join(context->fec_process_pid, NULL) != 0) {
+            av_log(NULL, AV_LOG_ERROR, "%s",__FUNCTION__);
+        }
+        context->fec_process_thread = -1;
+    }
+
 
     pthread_mutex_lock(&(context->mLock));
     cur = context->queue_av;
     while(cur != NULL){
-       RTPPacket *next = cur->next;
-	av_free(cur->buf);
-	av_free(cur);
-	cur = next;
-	context->queue_len_av--;
-	av_log(NULL,AV_LOG_ERROR,"%s free av queue left size = %d", __FUNCTION__,context->queue_len_av);
+        RTPPacket *next = cur->next;
+        av_free(cur->buf);
+        av_free(cur);
+        cur = next;
+        context->queue_len_av--;
+  //      av_log(NULL,AV_LOG_ERROR,"%s free av queue left size = %d", __FUNCTION__,context->queue_len_av);
     }
     context->queue_av = NULL;
     context->av_queue_datasize = 0;
 
     cur = context->queue_fec;
     while(cur != NULL){
-       RTPPacket *next = cur->next;
-	av_free(cur->buf);
-	av_free(cur);
-	cur = next;
-	context->queue_len_fec--;
-	av_log(NULL,AV_LOG_ERROR,"%s free fec queue left size = %d", __FUNCTION__,context->queue_len_av);
+        RTPPacket *next = cur->next;
+        av_free(cur->buf);
+        av_free(cur);
+        cur = next;
+        context->queue_len_fec--;
+  //      av_log(NULL,AV_LOG_ERROR,"%s free fec queue left size = %d", __FUNCTION__,context->queue_len_fec);
     }
     context->queue_fec = NULL;
     context->fec_queue_datasize = 0;
 
-    if(context->recv_buff != NULL){
-        av_free(context->recv_buff);
-	 context->recv_buff = NULL;
-	 av_log(NULL,AV_LOG_ERROR,"%s free recv_buff", __FUNCTION__);
+    cur = context->av_process_header;
+    while(cur != NULL){
+        RTPPacket *next = cur->next;
+        av_free(cur->buf);
+        av_free(cur);
+        cur = next;
     }
 
-   pthread_mutex_unlock(&(context->mLock));
+    context->av_process_header = NULL;
+    context->av_process_tail = NULL;
+
+    if(context->recv_buff != NULL){
+        av_free(context->recv_buff);
+        context->recv_buff = NULL;
+    }
+    pthread_mutex_unlock(&(context->mLock));
+
+    pthread_mutex_destroy(&(context->mLock));
+    av_log(NULL,AV_LOG_ERROR,"%s out", __FUNCTION__);
 }

@@ -202,7 +202,7 @@ int fec_decode(RSFecContext *ctx, PBYTE *data, PBYTE *fec_data, int lost_map[]) 
 	for(int i = 0; i < lost_pkt_cnt; ++i) {
 		int cur_lost_pkt = lost_pkt_id[i];
 		memset(data[cur_lost_pkt],0,S);
-	       av_log(NULL, AV_LOG_ERROR, "%s,data[%d]= %p",__FUNCTION__,cur_lost_pkt,data[cur_lost_pkt]);
+//	    av_log(NULL, AV_LOG_ERROR, "%s,data[%d]= %p",__FUNCTION__,cur_lost_pkt,data[cur_lost_pkt]);
 		for(int r = 0; r < S; ++r) {
 			for(int l = 0; l < K; ++l) {
 				if (de_subGM[cur_lost_pkt][l] && recv_data[l][r])

@@ -82,6 +82,7 @@ typedef struct {
 
     int mIsHttpLive;// http living
     int mHttpLiveRetryCnt;// http living
+    int mHttpReconnectCnt;// http reconnect on end of stream
 #if CONFIG_ZLIB
     int compressed;
     z_stream inflate_stream;
@@ -490,6 +491,7 @@ static int http_open(URLContext *h, const char *uri, int flags)
     s->mZeroRange = 0;
     s->mIsHttpLive = 0;
     s->mHttpLiveRetryCnt = 0;
+    s->mHttpReconnectCnt = 0;
     
 #if HTTP_DEBUG
     av_log(h, AV_LOG_DEBUG, "http_open:uri = %s\n",uri);
@@ -1084,12 +1086,15 @@ static int http_buf_read(URLContext *h, uint8_t *buf, int size)
         s->off += len;
         if (s->chunksize > 0)
             s->chunksize -= len;
-    /*} else if (len == 0 && s->filesize > 0 && s->off < s->filesize - 1) {
+        s->mHttpReconnectCnt = 0;
+    } else if (len == 0 && s->filesize > 0 && s->off < s->filesize - 1 && s->mHttpReconnectCnt < 3) {
         av_log(NULL, AV_LOG_ERROR, "http_buf_read, socket may be closed by server, retry: s->off(%lld), s->filesize(%lld)", s->off, s->filesize);
-        len = special_read(h,buf,size);*/
+        s->mHttpReconnectCnt++;
+        len = special_read(h,buf,size);
     }
 
-    if(len <0 && s->mHlsConductor <= 0)
+    //s->mHlsConductor == 2 HLS点播下出现超时进行重连
+    if(len <0 && (s->mHlsConductor <= 0 || s->mHlsConductor == 2))
     {
         if(ff_check_operate(&h->interrupt_callback,OPERATE_SEEK,NULL,NULL))
         {
@@ -1113,7 +1118,12 @@ static int http_buf_read(URLContext *h, uint8_t *buf, int size)
         {
             s->mHttpLiveRetryCnt = 0;
             av_log(NULL,AV_LOG_DEBUG,"%s:len=%d",__FUNCTION__,len);
-            len = special_read(h,buf,size);
+            if (s->mHlsConductor == 2) {
+                if (len == AVERROR(ETIMEDOUT))
+                    len = special_read(h,buf,size);
+            } else {
+                len = special_read(h,buf,size);
+            }
         }
     } else {
         s->mHttpLiveRetryCnt = 0;

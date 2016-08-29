@@ -63,6 +63,9 @@ static int rtsp_read_close(AVFormatContext *s)
     ff_network_close();
     rt->real_setup = NULL;
     av_freep(&rt->real_setup_cache);
+    // close mutex
+    pthread_mutex_destroy(&rt->mRWLock);
+    av_log(NULL,AV_LOG_ERROR,"%s:destory mRWLock",__FUNCTION__);
     return 0;
 }
 
@@ -678,6 +681,15 @@ static int rtsp_read_header(AVFormatContext *s)
     RTSPState *rt = s->priv_data;
     int ret;
 
+    /*
+    *  初始化在RTSPState中新增的变量,尤其是mRWLock,如果mRWLock没有初始化
+    *  会导致读取数据或者重连时卡住
+    */
+    pthread_mutex_init(&rt->mRWLock, NULL);
+    rt->rtcp_flag = 0;
+    rt->rtp_cache_ctx = NULL;
+    rt->isReconnect = 0;
+    
     if (rt->initial_timeout > 0)
         rt->rtsp_flags |= RTSP_FLAG_LISTEN;
 
@@ -718,6 +730,9 @@ int ff_rtsp_tcp_read_packet(AVFormatContext *s, RTSPStream **prtsp_st,
     RTSPStream *rtsp_st;
 
     av_dlog(s, "tcp_read_packet:\n");
+    if(rt->rtsp_hd == NULL){
+        return -1;
+    }
 redo:
     for (;;) {
         RTSPMessageHeader reply;

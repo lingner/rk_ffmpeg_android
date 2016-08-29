@@ -42,6 +42,8 @@
 
 #define RTP_TX_BUF_SIZE  (64 * 1024)
 #define RTP_RX_BUF_SIZE  (128 * 1024)
+#define RTP_READ_TIMEOUTS       50 // 50*100ms
+#define RTP_READ_ERR_TIMEOUT    1003007
 
 typedef struct RTPContext {
     URLContext *rtp_hd, *rtcp_hd;
@@ -143,7 +145,7 @@ static int rtp_open(URLContext *h, const char *uri, int flags)
     char buf[1024];
     char path[1024];
     const char *p;
-
+    av_log(NULL, AV_LOG_ERROR, "%s,uri = %s",__FUNCTION__,uri);
     av_url_split(NULL, 0, NULL, 0, hostname, sizeof(hostname), &rtp_port,
                  path, sizeof(path), uri);
     /* extract parameters */
@@ -216,8 +218,11 @@ static int rtp_read(URLContext *h, uint8_t *buf, int size)
     struct sockaddr_storage from;
     socklen_t from_len;
     int len, n;
+    int timeout_cnt = 0;
+    int notify_timeout = 0;
     struct pollfd p[2] = {{s->rtp_fd, POLLIN, 0}, {s->rtcp_fd, POLLIN, 0}};
 
+    int head_read_flag = h->flags & AVIO_FLAG_RTP_TIMEOUT;
     for(;;) {
         if (ff_check_interrupt(&h->interrupt_callback))
             return AVERROR_EXIT;
@@ -254,6 +259,12 @@ static int rtp_read(URLContext *h, uint8_t *buf, int size)
             if (ff_neterrno() == AVERROR(EINTR))
                 continue;
             return AVERROR(EIO);
+        } 
+        // notify time out event to app, rtp_read_header only
+        else if (head_read_flag && notify_timeout == 0 && n == 0 && ++timeout_cnt >= RTP_READ_TIMEOUTS) {
+            ff_send_message(&h->interrupt_callback, MEDIA_FF_ERROR,  RTP_READ_ERR_TIMEOUT);
+            notify_timeout = 1;
+            av_log(s, AV_LOG_ERROR, "rtp_read_header rtp_read time out notify error\n");
         }
     }
     return len;

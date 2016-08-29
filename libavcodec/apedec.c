@@ -833,10 +833,14 @@ static int ape_decode_frame(AVCodecContext *avctx, void *data,
     int i, ch, ret;
     int blockstodecode;
 
+    if (s->samples < 0) {
+        *got_frame_ptr = 0;
+        av_log(avctx, AV_LOG_ERROR, "s->samples = %d", s->samples);
+        return AVERROR_INVALIDDATA;
+    }
     /* this should never be negative, but bad things will happen if it is, so
        check it just to make sure. */
     av_assert0(s->samples >= 0);
-
     if(!s->samples){
         uint32_t nblocks, offset;
         int buf_size;

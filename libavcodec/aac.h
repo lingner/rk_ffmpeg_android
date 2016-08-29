@@ -316,6 +316,9 @@ typedef struct AACContext {
 
     OutputConfiguration oc[2];
     int warned_num_aac_frames;
+    
+    //some aac file report /channel element %d.%d is not allocated/
+    int aac_err_num;
 } AACContext;
 
 #endif /* AVCODEC_AAC_H */

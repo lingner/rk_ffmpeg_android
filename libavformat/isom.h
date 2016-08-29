@@ -94,6 +94,7 @@ typedef struct MOVSbgp {
 
 typedef struct MOVStreamContext {
     AVIOContext *pb;
+    AVIOContext *pb_slave;
     int ffindex;          ///< AVStream index
     int next_chunk;
     unsigned int chunk_count;
@@ -163,14 +164,6 @@ typedef struct MOVContext {
     int use_absolute_path;
     int ignore_editlist;
     int64_t next_root_atom; ///< offset of the next root atom
-
-    int   read_packet_policy;
-    int   stream_index_video;
-    int   stream_index_audio;
-    float chunk_distance_video;
-    float chunk_distance_audio;
-    int   chunk_index_video;
-    int   chunk_index_audio;
 } MOVContext;
 
 int ff_mp4_read_descr_len(AVIOContext *pb);

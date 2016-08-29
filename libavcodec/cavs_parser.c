@@ -29,11 +29,12 @@
 #include "cavs.h"
 
 
+#define CAVS_PROFILE_AVSPLUS 0x48
 /**
  * Find the end of the current frame in the bitstream.
  * @return the position of the first byte of the next frame, or -1
  */
-static int cavs_find_frame_end(ParseContext *pc, const uint8_t *buf,
+static int cavs_find_frame_end(ParseContext *pc, AVCodecContext *avctx, const uint8_t *buf,
                                int buf_size) {
     int pic_found, i;
     uint32_t state;
@@ -45,6 +46,11 @@ static int cavs_find_frame_end(ParseContext *pc, const uint8_t *buf,
     if(!pic_found){
         for(i=0; i<buf_size; i++){
             state= (state<<8) | buf[i];
+            if(state == CAVS_START_CODE) {
+                if(i + 1 < buf_size)
+                    if(buf[i+1] ==  CAVS_PROFILE_AVSPLUS)
+                        avctx->codec_tag = MKTAG('a', 'v', 's', '+');
+            }
             if(state == PIC_I_START_CODE || state == PIC_PB_START_CODE){
                 i++;
                 pic_found=1;
@@ -84,7 +90,7 @@ static int cavsvideo_parse(AVCodecParserContext *s,
     if(s->flags & PARSER_FLAG_COMPLETE_FRAMES){
         next= buf_size;
     }else{
-        next= cavs_find_frame_end(pc, buf, buf_size);
+        next= cavs_find_frame_end(pc, avctx, buf, buf_size);
 
         if (ff_combine_frame(pc, next, &buf, &buf_size) < 0) {
             *poutbuf = NULL;
