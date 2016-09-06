@@ -5,7 +5,8 @@
 # FFmpeg builds script for Android+ARM
 
 ######################################################
-NDK=/home/public/android_ndk/android-ndk-r10d
+#NDK=/home/public/android_ndk/android-ndk-r10d
+NDK=/home/mid_sdk/android-ndk-r9c
 
 PLATFORM=$NDK/platforms/android-17/arch-arm
 

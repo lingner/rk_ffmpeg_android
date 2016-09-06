@@ -656,7 +656,7 @@ int avformat_open_input(AVFormatContext **ps, const char *filename, AVInputForma
     int ret = 0;
     AVDictionary *tmp = NULL;
     ID3v2ExtraMeta *id3v2_extra_meta = NULL;
-    av_log(NULL,AV_LOG_ERROR,"ffmpeg version v2.0 16-08-18\n");
+    av_log(NULL,AV_LOG_ERROR,"ffmpeg version v2.0 16-08-31\n");
     if (!s && !(s = avformat_alloc_context()))
         return AVERROR(ENOMEM);
     if (!s->av_class){
@@ -1621,6 +1621,9 @@ static int try_decode_frame(AVStream *st, AVPacket *avpkt, AVDictionary **option
             ret = avcodec_decode_subtitle2(st->codec, &subtitle,
                                            &got_picture, &pkt);
             ret = pkt.size;
+            if (got_picture) {                
+                avsubtitle_free(&subtitle);
+            }
             break;
         default:
             break;
