@@ -2206,12 +2206,15 @@ static int mov_check_connect_policy(MOVContext *mc, AVStream *st){
         int s_per_chunk = sc->sample_count/sc->chunk_count;
         if(s_per_chunk >= 10){
             av_log(NULL, AV_LOG_ERROR, "[TRACE-MOV]mov_check_connect_policy: chunk case");
-            if (!avio_open2(&sc->pb_slave, mc->fc->filename, AVIO_FLAG_READ, &mc->fc->interrupt_callback, NULL)){
+            AVDictionary *opts = NULL;
+            av_dict_set(&opts, "timeout", "400000", 0);
+            if (!avio_open2(&sc->pb_slave, mc->fc->filename, AVIO_FLAG_READ, &mc->fc->interrupt_callback, &opts)){
                 av_log(mc->fc, AV_LOG_ERROR, "[TRACE-MOV]mov_check_connect_policy open new AVIOContext, sc->pb_slave=%p", sc->pb_slave);
             }else{
                 sc->pb_slave = NULL;
                 av_log(mc->fc, AV_LOG_ERROR, "[TRACE-MOV]mov_check_connect_policy Fail to open AVIOContext");
             }
+            av_dict_free(&opts);
         }
     }
 

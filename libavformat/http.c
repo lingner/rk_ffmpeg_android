@@ -283,6 +283,16 @@ static void http_save_redirect_url(URLContext *h, HTTPContext *s, char* location
         params->redirect = 1;
     }
 }
+
+static void http_save_http_code(URLContext *h, int http_code)
+{
+    AVIOParams *params = h->interrupt_callback.ioparams;
+    if(params && params->type==1) {
+        params->http_code = http_code;
+    }
+}
+
+
 //Persist http connection end
 
 /* return non zero if error */
@@ -391,8 +401,24 @@ static int http_open_cnx(URLContext *h)
                 av_log(NULL,AV_LOG_DEBUG,"http_open_cnx:ffurl_open ok");
 #endif
 
-    if (http_connect(h, path, local_path, hoststr, auth, proxyauth, &location_changed) < 0)
+    if (http_connect(h, path, local_path, hoststr, auth, proxyauth, &location_changed) < 0) {
+        //win10 dlna wmv no support seek by fxw
+        if (s->http_code == 406 && s->off == 0) {
+            attempts++;
+            av_log(NULL, AV_LOG_ERROR,"%s: HTTP error 406 Not Acceptable, attempts: %d\n", __FUNCTION__, attempts);
+            if (attempts < 2) {
+                s->seekable = 0;
+                if (s->hd) {
+                    ffurl_closep(&s->hd);
+                    http_reset_params(h);
+                }
+                goto redo;
+            } 
+        }
+        
         goto fail;
+    }
+    
     attempts++;
     if (s->http_code == 401) {
         if ((cur_auth_type == HTTP_AUTH_NONE || s->auth_state.stale) &&
@@ -412,6 +438,7 @@ static int http_open_cnx(URLContext *h)
         } else
             goto fail;
     }
+    
     if ((s->http_code == 301 || s->http_code == 302 || s->http_code == 303 || s->http_code == 307)
         && location_changed == 1) {
         /* url moved, get next */
@@ -444,16 +471,24 @@ static int http_open_cnx(URLContext *h)
     //2. Save new connection
     if(new_conn)
         http_set_persist_conn(h, s, hostname, port);
+    http_save_http_code(h, s->http_code);
     return 0;
  fail:
  	
     av_log(h, AV_LOG_DEBUG, "http_open_cnx fail:code=%d,err = %d,ETIMEDOUT = %d",s->http_code,err,ETIMEDOUT);
+    http_save_http_code(h, s->http_code);
     h->errcode = s->http_code;
     if(h->errcode != 0 && h->errcode > 0)
     {
         if (((h->errcode == 403) || (h->errcode == 404))&&((oldErrcode!= 403) || (oldErrcode != 404)))
             ff_send_message(&h->interrupt_callback,MEDIA_INFO_DOWNLOAD_ERROR,h->errcode);
     }
+
+    if (err == -5) 
+    {
+        ff_send_message(&h->interrupt_callback, MEDIA_INFO_CONNECT_TIMEOUT, HTTP_TIMEOUT);// HTTP_TIMEOUT
+    }
+	
 #if 0
     av_log(h, AV_LOG_DEBUG, "http_open_cnx :*********err = %d,ETIMEDOUT = %d",err,ETIMEDOUT);
     if((err == -ETIMEDOUT) || (err == -101))
@@ -461,6 +496,7 @@ static int http_open_cnx(URLContext *h)
         ff_send_message(&h->interrupt_callback,MEDIA_INFO_DOWNLOAD_ERROR,100000);// HTTP_TIMEOUT
     }
 #endif    
+
     if (s->hd){
         ffurl_closep(&s->hd);
         http_reset_params(h);
@@ -659,14 +695,15 @@ static int parse_location(HTTPContext *s, const char *p)
 {    
     char redirected_location[MAX_URL_SIZE], *new_loc;
     ff_make_absolute_url(redirected_location, sizeof(redirected_location),s->location, p);
-    new_loc = av_strdup(redirected_location);
+//    new_loc = av_strdup(redirected_location);
     
-    if (!new_loc)
-        return AVERROR(ENOMEM);
+//    if (!new_loc)
+//        return AVERROR(ENOMEM);
 //    av_free(s->location);
 //    s->location = new_loc;
-     av_strlcpy(s->location, new_loc, sizeof(s->location));
-//    av_log(NULL,AV_LOG_ERROR,"parse_location:new:%s",s->location);
+//     av_strlcpy(s->location, new_loc, sizeof(s->location));
+    av_log(NULL,AV_LOG_ERROR,"parse_location:new:%s",s->location);
+      av_strlcpy(s->location, redirected_location, sizeof(s->location));  
     return 0;
 }
 
@@ -861,7 +898,7 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
         // user agent: AppleCoreMedia/1.0.0.9A405 (iPad; U; CPU OS 5_0_1 like Mac OS X; zh_cn)
         len += av_strlcatf(headers + len, sizeof(headers) - len,
                            "User-Agent: %s\r\n",
-                           s->user_agent ? s->user_agent :"Mozilla/4.0 (compatible; MS IE 6.0; (ziva))");
+                           s->user_agent ? s->user_agent :"AppleCoreMedia/1.0.0.7B367 (iPad; U; CPU OS 4_3_3 like Mac OS X)");
     }
 	//if some url can't open ,try to shiled this
 	#if 1              

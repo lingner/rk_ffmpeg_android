@@ -953,7 +953,7 @@ static int ebml_parse_elem(MatroskaDemuxContext *matroska,
         /*add by hh for filter DIVX
         * some information type = EBML_NONE in segments 
         */
-        if(length > 0)
+        if(length > 0 && length < 1024 * 1024)
         {
             char* buffer = av_malloc(length+1);
             if(buffer != NULL){
@@ -2438,7 +2438,9 @@ static int matroska_read_seek(AVFormatContext *s, int stream_index,
         tracks[i].audio.sub_packet_cnt = 0;
         tracks[i].audio.buf_timecode = AV_NOPTS_VALUE;
         tracks[i].end_timecode = 0;
+        //probe out subtitle track, but this track may be no track.(redmine:103980)
         if (tracks[i].type == MATROSKA_TRACK_TYPE_SUBTITLE
+            && (NULL != tracks[i].stream)
             && tracks[i].stream->discard != AVDISCARD_ALL) {
             index_sub = av_index_search_timestamp(tracks[i].stream, st->index_entries[index].timestamp, AVSEEK_FLAG_BACKWARD);
             if (index_sub >= 0

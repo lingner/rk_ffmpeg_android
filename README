@@ -19,14 +19,18 @@ FFmpeg README
 * Modify build_32.sh, Config your NDK path
   (eg. NDK=/home/androd_ndk/android-ndk-r9d)
 * Move this project to Your_SDK_Root/external/ffmpeg
-* Change Permissions of configure and build_32.sh. 
+* Change Permissions of configure and build_32bit_5.0.sh/build_32bit_6.0.sh 
   #chmod 766 configure
-  #chmod 766 build_32.sh
+  #chmod 766 build_32bit_5.0.sh
+  #chmod 766 build_32bit_6.0.sh
   #chmod 766 version.sh
-* execute ./build_32.sh, then you will find libffmpeg.so in directory(./android/armv7-a/) 
+* execute ./build_32bit_5.0.sh for android5.0; 
+  execute ./build_32bit_6.0.sh for android6.0, 
+  then you will find libffmpeg.so in directory(./android/armv7-a/) 
 
 4) You Can Use Precompiled Library(libffmpeg.so)
-* You Can find libffmpeg.so in android/arm32/libffmpeg.so on the git hub
+* You Can find libffmpeg.so in android/arm32/5.0/libffmpeg.so for android5.0
+  You Can find libffmpeg.so in android/arm32/6.0/libffmpeg.so for android6.0
 
 5) How to Use libffmpeg.so in Your SDK
 * REPLACE vendor/<venderid>/common/vpu/lib/arm/<chip_id>/libffmpeg.so in your sdk 

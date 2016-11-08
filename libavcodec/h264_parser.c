@@ -277,7 +277,18 @@ static inline int parse_nal_units(AVCodecParserContext *s,
             	avcodec_set_dimensions(avctx, pic_width, pic_height);
             	avctx->width  -= (2>>CHROMA444)*FFMIN(h->sps.crop_right, (8<<CHROMA444)-1);
             	avctx->height -= (1<<chroma_y_shift)*FFMIN(h->sps.crop_bottom, (16>>chroma_y_shift)-1) * (2 - h->sps.frame_mbs_only_flag);
-            	av_log(NULL, AV_LOG_ERROR, "%s parse avctx->width: %d", __FUNCTION__, avctx->width);
+                av_log(NULL, AV_LOG_ERROR, "%s parse width: %d height: %d", __FUNCTION__, avctx->width, avctx->height);
+
+                if (h->sps.video_signal_type_present_flag) {
+                    avctx->color_range = h->sps.full_range > 0 ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+                    if (h->sps.colour_description_present_flag) {
+                        avctx->color_primaries = h->sps.color_primaries;
+                        avctx->color_trc       = h->sps.color_trc;
+                        avctx->colorspace      = h->sps.colorspace;
+                    }
+		    av_log(NULL, AV_LOG_ERROR, "%s parse color_range: %d color_primaries: %d color_trc: %d", __FUNCTION__, avctx->color_range, avctx->color_primaries, avctx->color_trc);
+		}
+
             }
 
 #if 0

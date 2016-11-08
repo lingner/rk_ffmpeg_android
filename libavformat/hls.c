@@ -44,8 +44,8 @@
 #define DOWNLOAD_M3U8_END -1
 
 #define TIMEOUT 2000
-#define MAX_BANDWIDTH_QUEUE_SIZE 2000 //100 配置最近读取数据次数，用于计算数据下载速度
-#define ESTIMATE_BANDWIDTH_START 200  // 2  配置从第几次读取后开始计算下载速度
+#define MAX_BANDWIDTH_QUEUE_SIZE 2000 // 配置最近读取数据次数，用于计算数据下载速度
+#define ESTIMATE_BANDWIDTH_START 400  //  配置从第几次读取后开始计算下载速度
 
 /*
  * An apple http stream consists of a playlist with media segment files,
@@ -100,6 +100,7 @@ typedef struct bandWidthqueue{
 	int num;
     int64_t mTotalSize;
     int64_t mTotalTimeUs;
+    int64_t mStartTimeUs;
 }BandWidthQueue;
 
 /*
@@ -136,6 +137,7 @@ struct variant {
 
     char key_url[MAX_URL_SIZE];
     uint8_t key[16];
+    int reload_retry_cnt;
 };
 
 typedef struct HLSContext {
@@ -180,6 +182,7 @@ BandWidthQueue* InitQueue()
 		pqueue->num = 0;
         pqueue->mTotalSize = 0;
         pqueue->mTotalTimeUs = 0;
+        pqueue->mStartTimeUs = av_gettime();
 	}
 	return pqueue;
 }
@@ -193,9 +196,8 @@ int IsEmpty(BandWidthQueue *pqueue)
 	if(pqueue->front == NULL && pqueue->rear == NULL && pqueue->num == 0)
 	{
 		return 1;
-	}else{
-		return 0;
-	}
+	}   
+	return 0;
 }
 BandWidthContext *  DeQueue(BandWidthQueue *pqueue)  
 {  
@@ -205,7 +207,7 @@ BandWidthContext *  DeQueue(BandWidthQueue *pqueue)
         return NULL;
     }
     BandWidthContext* pnode = pqueue->front;  
-    if(IsEmpty(pqueue)!=1 && pnode!=NULL)  
+    if(IsEmpty(pqueue)==0 && pnode!=NULL)  //empty is false
     {  
         pqueue->num--;  
         pqueue->front = pnode->next;  
@@ -230,7 +232,7 @@ void  EnQueue(BandWidthQueue *pqueue, int32_t size, int64_t time)
         pnode->msize = size;  
 		pnode->mtime = time;  
         pnode->next = NULL;  
-        if(IsEmpty(pqueue))  
+        if(IsEmpty(pqueue) == 1)  //empty is true 
         {  
             pqueue->front = pnode;  
         }  
@@ -250,16 +252,16 @@ void  EnQueue(BandWidthQueue *pqueue, int32_t size, int64_t time)
 }  
 void ClearQueue(BandWidthQueue *pqueue)
 {
-	while(IsEmpty(pqueue) != 0){
-		DeQueue(pqueue);
-	}
+    while(IsEmpty(pqueue) == 0){// empty is false
+        DeQueue(pqueue);
+    }
 }
 void DestroyQueue(BandWidthQueue * pqueue)
 {
-	if(IsEmpty(pqueue) != 1)
-		ClearQueue(pqueue);
+    if(IsEmpty(pqueue) == 0)// empty is false
+        ClearQueue(pqueue);
     if(pqueue != NULL)
-	av_free(pqueue);
+        av_free(pqueue);
 }
 int GetSize(BandWidthQueue *pqueue)  
 {  
@@ -272,7 +274,10 @@ int GetSize(BandWidthQueue *pqueue)
 }  
 int EstimateBandwidth(HLSContext *c,int32_t *bandwidth_bps)
 {
-        if(GetSize(c->BandWidthqueue) >= ESTIMATE_BANDWIDTH_START)
+        int queue_size = GetSize(c->BandWidthqueue);
+        int64_t diffTimeUs = av_gettime() - c->BandWidthqueue->mStartTimeUs;
+        //av_log(NULL, AV_LOG_ERROR,  "EstimateBandwidth change, queue_size = %d, diffTimeUs = %lld", queue_size, diffTimeUs);
+        if(queue_size >= ESTIMATE_BANDWIDTH_START || (queue_size > ESTIMATE_BANDWIDTH_START / 2 && diffTimeUs > 15000000))
         {
         
             av_log(NULL, AV_LOG_DEBUG, "c->Bandwidthqueue->mTotalSize = %lld", c->BandWidthqueue->mTotalSize);
@@ -316,7 +321,7 @@ int SortBandwidth(HLSContext* c)
     
     av_free(ptr);
     ptr = NULL;
-
+    return 0;
 }
 
 static int read_chomp_line(AVIOContext *s, char *buf, int maxlen)
@@ -348,6 +353,13 @@ static void free_variant_list(HLSContext *c)
             ffurl_close(var->input);
         if (var->ctx) {
             var->ctx->pb = NULL;
+            for (int i = 0; i < var->ctx->nb_streams; i++) {
+                AVStream *st = var->ctx->streams[i];
+                if (st->info)
+                    av_freep(&st->info);
+                if (st->codec->codec_id != AV_CODEC_ID_NONE)
+                    avcodec_close(st->codec);
+            }            
             avformat_close_input(&var->ctx);
         }
         av_free(var);
@@ -357,6 +369,12 @@ static void free_variant_list(HLSContext *c)
         struct bandwidth_info * tmp = c->bandwidth_info[i];
         av_free(tmp);
     }
+    if(c->BandWidthqueue != NULL)
+    {
+        DestroyQueue(c->BandWidthqueue);
+        c->BandWidthqueue = NULL;
+    }
+   
     av_freep(&c->variants);
     av_freep(&c->bandwidth_info);
     c->n_variants = 0;
@@ -425,6 +443,122 @@ static void handle_key_args(struct key_info *info, const char *key,
     }
 }
 
+static void handle_parse_save_cookie(HLSContext *c, const char *url, AVFormatContext *s, AVIOContext *in)
+{   
+    AVIOParams *ioparams = c->interrupt_callback->ioparams;
+    if (ioparams && ioparams->type == 1) {
+        ioparams->parse_try_cnt = 0;
+        if (s && in && in->opaque && !av_strcasecmp(url, s->filename)) {
+            URLContext *url_ctx = in->opaque;
+            URLContext *url_parent = s->pb->opaque;
+                
+            if (url_ctx->cookies != NULL && url_parent->cookies != NULL) {
+                int new_cookie_len = strlen(url_ctx->cookies);
+                int parent_cookie_len = strlen(url_parent->cookies);
+                av_log(NULL, AV_LOG_ERROR, "%s: new cookie: %s, old cookie: %s", __FUNCTION__, url_ctx->cookies, url_parent->cookies);
+                if (new_cookie_len > parent_cookie_len && parent_cookie_len > 0) {
+                    av_log(NULL, AV_LOG_ERROR, "%s: realloc cookie mem size: %d", __FUNCTION__, new_cookie_len);
+                    av_free(url_parent->cookies);
+                    url_parent->cookies = av_mallocz(new_cookie_len);
+                } else {
+                    memset(url_parent->cookies, 0, parent_cookie_len);
+                }
+                strcpy(url_parent->cookies, url_ctx->cookies);
+                av_log(NULL, AV_LOG_ERROR, "%s: parent cookie: %s", __FUNCTION__, url_parent->cookies);
+            }
+        }
+    }
+}
+
+static void handle_parse_open_result(HLSContext *c, int ret)
+{   
+    AVIOParams *ioparams = c->interrupt_callback->ioparams;
+    if (ioparams && ioparams->type == 1) {
+        if (ret == 0) {
+            ioparams->parse_try_cnt = 0;
+            return;
+        }
+        
+        av_log(NULL, AV_LOG_ERROR, "%s:avio_open parse_try_cnt: %d", __FUNCTION__, ioparams->parse_try_cnt);
+        ioparams->parse_try_cnt ++;
+        if (ioparams->parse_try_cnt < 3) {
+            return;
+        }
+        
+        if (ioparams->redirect == 1) {
+            memset(ioparams->url, 0, sizeof(ioparams->url));
+            ioparams->url[0] = '\0';
+            ioparams->redirect = 0;
+            av_log(NULL, AV_LOG_ERROR, "%s:avio_open reset ioparams url", __FUNCTION__);
+        }
+    }
+}
+
+
+static int parse_root_playlist(HLSContext *c, AVFormatContext *s, struct variant *var, const char *url)
+{
+    av_log(NULL, AV_LOG_ERROR,"HLS parse root playlist in\n");
+    AVIOContext *in = NULL;
+    int ret = 0;
+    
+    AVDictionary *opts = NULL;
+    /* Some HLS servers dont like being sent the range header */
+    av_dict_set(&opts, "seekable", "0", 0);
+    if (c->cookies) {
+        av_dict_set(&opts, "cookies", c->cookies, 0);
+    }
+    av_dict_set(&opts, "timeout", "5000000", 0);
+    av_dict_set(&opts, "multiple_requests", "0", 0);
+    av_dict_set(&opts, "hls_parse", "1", 0);
+    if(strlen(c->header) > 0) {
+        av_dict_set(&opts, "headers", c->header, 0);
+    }
+    ret = avio_open2(&in, url, AVIO_FLAG_READ,
+                     c->interrupt_callback, &opts);
+    av_dict_free(&opts);
+    if (ret < 0) {
+        av_log(NULL, AV_LOG_ERROR, "%s failed, ret = %d\n", __FUNCTION__, ret);
+        return ret;
+    }
+    
+    handle_parse_save_cookie(c, url, s, in);
+
+    //parse root url play list
+    char line[1024];
+    const char *ptr;
+    int is_variant = 0, bandwidth = 0;
+    while (!url_feof(in) && var) {
+        if (ff_check_interrupt(c->interrupt_callback))
+            return AVERROR_EXIT;
+        
+        memset(line, 0, sizeof(line));
+        read_chomp_line(in, line, sizeof(line));
+
+        if (av_strstart(line, "#EXT-X-STREAM-INF:", &ptr)) {
+            struct variant_info info = {{0}};
+            is_variant = 1;
+            ff_parse_key_value(ptr, (ff_parse_key_val_cb) handle_variant_args, &info);
+            bandwidth = atoi(info.bandwidth);
+        } else if (av_strstart(line, "#", NULL)) {
+            continue;
+        } else if (line[0]) {
+            if (is_variant) {
+                av_log(NULL, AV_LOG_ERROR,"%s: new variant bandwidth = %d, var_bandwitdh = %d\n", __FUNCTION__, bandwidth, var->bandwidth);
+                if (var->bandwidth == 0 || bandwidth == 0 || var->bandwidth == bandwidth) {
+                    av_log(NULL, AV_LOG_ERROR,"%s: old variant url = %s\n", __FUNCTION__, var->url);
+                    strcpy(var->url, line);
+                    av_log(NULL, AV_LOG_ERROR,"%s: new variant url = %s\n", __FUNCTION__, var->url);
+                    break;
+                }
+            }
+        }
+    }
+    
+    avio_close(in);
+    av_log(NULL, AV_LOG_ERROR,"HLS parse root playlist ok\n");
+    return ret;
+}
+
 static int parse_playlist(HLSContext *c, const char *url,
                           struct variant *var, AVIOContext *in)
 {
@@ -434,7 +568,7 @@ static int parse_playlist(HLSContext *c, const char *url,
         url = ioparams->url;
     }
 #if HLS_DEBUG
-    //av_log(NULL, AV_LOG_ERROR,"[debug-hls]parse_playlist, url = %s\n", url);
+    av_log(NULL, AV_LOG_DEBUG,"HLS parse_playlist in, url = %s\n", url);
 #endif
 
 	DistontinutyStatus distontinuty_status = Distontinuty_NONE; //add by xhr, for QVOD
@@ -470,7 +604,7 @@ static int parse_playlist(HLSContext *c, const char *url,
 
         //Init http persist connection params
         if(c->misHeShiJie==1&&!c->interrupt_callback->ioparams){
-            c->interrupt_callback->ioparams = av_malloc(sizeof(struct AVIOParams));
+            c->interrupt_callback->ioparams = av_mallocz(sizeof(struct AVIOParams));
             AVIOParams *params = c->interrupt_callback->ioparams;
             if(params) {
                 params->host[0] = '\0';
@@ -491,16 +625,12 @@ static int parse_playlist(HLSContext *c, const char *url,
                          c->interrupt_callback, &opts);
         av_log(NULL,AV_LOG_ERROR,"%s:avio_open2 ",__FUNCTION__);
         av_dict_free(&opts);
+        handle_parse_open_result(c, ret);
         if (ret < 0)
         {
 #if HLS_DEBUG
             av_log(NULL,AV_LOG_DEBUG,"%s:avio_open failed ret=0x%x",__FUNCTION__,ret);
 #endif
-            if(ioparams&&ioparams->type==1)
-            {
-                ioparams->url[0] = '\0';
-                ioparams->redirect = 0;
-            }
             return ret;
         }
     }
@@ -845,11 +975,8 @@ static int parse_playlist(HLSContext *c, const char *url,
 #if HLS_DEBUG
     if(var)
     {
-        struct variant *var_0 = c->variants[0];
-        //av_log(NULL, AV_LOG_ERROR,"[debug-hls](var->cur_seq_no = %d; var->bandwidth =% d ",var_0->cur_seq_no, var_0->bandwidth);
 
-        av_log(NULL, AV_LOG_ERROR,"[debug-hls]%s cur_seq_no=%d,start_seq_no=%d,last_seq_no=%d,var->n_segments = %d",
-                     __FUNCTION__,var->cur_seq_no,var->start_seq_no,var->start_seq_no+var->n_segments,var->n_segments);
+        av_log(NULL, AV_LOG_DEBUG,"%s::firstQ=%d,curQ=%d,LastQ=%d,var->n_segments = %d",__FUNCTION__,var->start_seq_no,var->cur_seq_no,var->start_seq_no+var->n_segments,var->n_segments);
     }
 
 #endif
@@ -858,6 +985,41 @@ fail:
     if (close_in)
         avio_close(in);
     return ret;
+}
+
+static void handle_parse_list_err(HLSContext *c, struct variant *var) 
+{
+    AVIOParams *ioparams = c->interrupt_callback->ioparams;
+    if (ioparams && ioparams->type == 1 && ioparams->redirect == 0 && var) {
+        av_log(NULL, AV_LOG_ERROR, "%s:parse list http_code: %d, retry: %d", __FUNCTION__, ioparams->http_code, ioparams->parse_try_cnt);
+        if (ioparams->http_code == 401 | ioparams->http_code == 403 || ioparams->http_code == 404) {
+            ioparams->parse_try_cnt ++;
+            if (ioparams->parse_try_cnt < 6) {
+                return;
+            }
+            
+            c->cookies = NULL;
+            av_log(NULL, AV_LOG_ERROR, "%s:parse list clear cookies", __FUNCTION__);
+            int retry_cnt = 5;
+            do {
+                int ret = 0; 
+                av_log(NULL, AV_LOG_ERROR, "%s:parse list with root url: %s, retry: %d", __FUNCTION__, var->parent->filename, retry_cnt);
+                if ((ret = parse_root_playlist(c, var->parent, var, var->parent->filename)) < 0){
+                    if(ret == AVERROR_EXIT || var->parent->exit_flag){
+                        ret = AVERROR_EOF;
+                        break;
+                    }
+                    av_usleep(300*1000);
+                } else {
+                    URLContext *u = var->parent->pb->opaque;
+                    c->cookies = u->cookies;
+                    ioparams->parse_try_cnt = 0;
+                    break;
+                }
+                retry_cnt --;
+            } while (retry_cnt > 0);
+        }
+    }
 }
 
 static int open_input(HLSContext *c, struct variant *var)
@@ -1016,30 +1178,45 @@ static int has_segment_discontinuity(struct variant *v)
     return 0;
 }
 
-static int usleep_cmcc_parse_list(HLSContext *c, int parse_list_retry)
+static int64_t cmcc_get_reload_interval(struct variant *v)
 {
-    //for huawei sleep 1s、1s、1s、2s、5s、10s...
-    int sleepCnt = 0;
-    if (parse_list_retry < 4) {
-        sleepCnt = 2;//1s
-    } else if (parse_list_retry == 4) {
-        sleepCnt = 4;//2s
-    } else if (parse_list_retry == 5) {
-        sleepCnt = 10;//5s  
+    //for cmcc reload 1s、1s、1s、2s、5s、10s...
+    int64_t reload_interval = 0;
+    int reload_retry_cnt = v->reload_retry_cnt;
+    if (reload_retry_cnt == 0) {
+        /* If this is a live stream and the reload interval has elapsed since
+         * the last playlist reload, reload the variant playlists now. */
+        reload_interval = v->n_segments > 0 ?
+                                  v->segments[v->n_segments - 1]->duration :
+                                  v->target_duration;     
+        reload_interval = FFMIN(reload_interval, FFMIN(v->target_duration, 9));
+    } else if (reload_retry_cnt < 4) {
+        reload_interval = 1;
+    } else if (reload_retry_cnt == 4) {
+        reload_interval = 2;
+    } else if (reload_retry_cnt == 5) {
+        reload_interval = 5;  
     } else {
-        sleepCnt = 10;// 20 10s
+        reload_interval = 10;
     }
     
+    return reload_interval;
+}
+
+static int cmcc_usleep_parse_list(HLSContext *c)
+{
+    //ulseep 1.4s
+    int sleepCnt = 7;
     while (sleepCnt > 0) {
         if (ff_check_interrupt(c->interrupt_callback))
             return AVERROR_EXIT;
         sleepCnt --;
-        av_usleep(500*1000);
+        av_usleep(200*1000);
     }
     return 0;
 }
 
-static int check_parse_playlist(struct variant *v, int64_t *reload_interval, int parse_list_retry, int *ret)
+static int check_parse_playlist(struct variant *v, int64_t *reload_interval, int *ret)
 {
     HLSContext *c = v->parent->priv_data;
     *ret = 0;
@@ -1060,9 +1237,14 @@ static int check_parse_playlist(struct variant *v, int64_t *reload_interval, int
 #endif            
         int64_t startTime = av_gettime();
         ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_START,-1); // c->interrupt_callback
+        int64_t reload_time = v->target_duration / 2;
+        int last_start_seq_no = v->start_seq_no;
+        int last_n_segments = v->n_segments;
         if ((*ret = parse_playlist(c, v->url, v, NULL)) < 0) {
             
             av_log(NULL, AV_LOG_DEBUG,"read_data():parse_playlist, ret = 0x%x",*ret);
+            handle_parse_list_err(c, v);
+            
 			int errorcode = TIMEOUT;
 	        if(v != NULL)
             {
@@ -1072,21 +1254,33 @@ static int check_parse_playlist(struct variant *v, int64_t *reload_interval, int
                     errorcode = input->errcode;
                     av_log(NULL,AV_LOG_DEBUG,"read_data():parse_playlist, errorcode = %d",errorcode);
                 }
+                v->reload_retry_cnt = 0;
             }
             
-            int uret = usleep_cmcc_parse_list(c, parse_list_retry);
+            int uret = cmcc_usleep_parse_list(c);
             if (uret != 0) return uret;
             ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_ERROR,errorcode);
         } else {
              //add info for AliyunOS
-             v->ts_last_time = av_gettime();
-           
-             ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_END,(av_gettime()-startTime)/1000);
+            v->ts_last_time = av_gettime();
+
+            // cmcc reload interval 1s、1s、1s、2s、5s、10s...
+            if (last_start_seq_no == v->start_seq_no && last_n_segments == v->n_segments) {
+                v->reload_retry_cnt = v->reload_retry_cnt + 1;
+                reload_time = cmcc_get_reload_interval(v);
+                av_log(NULL, AV_LOG_ERROR,"hls m3u8 list no update, reload_interval = %lld, try = %d\n", reload_time, v->reload_retry_cnt);
+            } else {
+                v->reload_retry_cnt = 0;
+                reload_time = cmcc_get_reload_interval(v);
+                av_log(NULL, AV_LOG_ERROR,"hls m3u8 list updated, reload_interval = %lld\n", reload_time);
+            }
+            
+            ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_END,(av_gettime()-startTime)/1000);
         }
         /* If we need to reload the playlist again below (if
          * there's still no more segments), switch to a reload
          * interval of half the target duration. */
-        *reload_interval = v->target_duration * 500000LL;
+        *reload_interval = reload_time * 1000000LL;
     }
     return 0;
 }
@@ -1095,7 +1289,7 @@ static int read_data(void *opaque, uint8_t *buf, int buf_size)
 {
     struct variant *v = opaque;
     HLSContext *c = v->parent->priv_data;
-    int ret, i,retry = 0,parse_list_retry = 0,read_timeout_cnt = 0;
+    int ret, i,retry = 0,read_timeout_cnt = 0;
     int64_t last_open_timeUs = av_gettime();
     int sliceSmooth = 0;//Slice smooth handle  by fxw
     if(v->parent->exit_flag){
@@ -1104,34 +1298,25 @@ static int read_data(void *opaque, uint8_t *buf, int buf_size)
     int64_t reload_interval = 0;
 restart:
     
-    /* If this is a live stream and the reload interval has elapsed since
-         * the last playlist reload, reload the variant playlists now. */
-    reload_interval = v->n_segments > 0 ?
-                              v->segments[v->n_segments - 1]->duration :
-                              v->target_duration;     
-    //for huawei cmcc
-    reload_interval = FFMIN(reload_interval, FFMIN(v->target_duration, 9));
-    
+    reload_interval = cmcc_get_reload_interval(v);
     reload_interval *= 1000000;
     int expired_list = 0;
     int chk_ret = 0;
     
 reload:    
 
-    chk_ret = check_parse_playlist(v, &reload_interval, parse_list_retry, &ret);
+    chk_ret = check_parse_playlist(v, &reload_interval, &ret);
     if (chk_ret != 0) {
         return chk_ret;
     }
 
     if (ret < 0) {
-        parse_list_retry ++;
         if(expired_list == 1){
-            av_log(NULL,AV_LOG_DEBUG,"open_input time out, need retry parse list %d", parse_list_retry);
+            av_log(NULL, AV_LOG_DEBUG, "open_input time out, need retry parse list");
             goto reload;
         }
     } else {
         expired_list = 0;
-        parse_list_retry = 0;
     }
 
     if (!v->input) {
@@ -1156,7 +1341,7 @@ reload:
                 v->cur_seq_no = v->start_seq_no;
             }
         }
-		av_log(NULL,AV_LOG_ERROR,"[debug-hls]read_data     cur_seq_no = %d,start_seq_no = %d,n_segments = %d",v->cur_seq_no,
+		av_log(NULL,AV_LOG_DEBUG,"read_data:cur_seq_no = %d,start_seq_no = %d,n_segments = %d",v->cur_seq_no,
 			v->start_seq_no,v->n_segments);
         if (v->cur_seq_no >= v->start_seq_no + v->n_segments) {
             if (v->finished){
@@ -1181,7 +1366,7 @@ reload:
             //Slice smooth handle, EXT-X-MEDIA-SEQUENCE  become too smaller than last time suddenly
             if(v->n_segments > 0 && (v->cur_seq_no-(v->start_seq_no + v->n_segments)>v->n_segments*10)){
                 sliceSmooth++;
-                av_log(NULL, AV_LOG_ERROR,"[debug-hls]%s:slice smooth times=%d, v->cur_seq_no=%d, v->start_seq_no=%d, v->n_segments=%d\n",
+                av_log(NULL, AV_LOG_ERROR,"%s:slice smooth times=%d, v->cur_seq_no=%d, v->start_seq_no=%d, v->n_segments=%d\n",
                             __FUNCTION__, sliceSmooth, v->cur_seq_no, v->start_seq_no, v->n_segments);
             }
             if(sliceSmooth>=3){
@@ -1216,8 +1401,7 @@ reload:
         v->ts_send_time = av_gettime();
         v->ts_first_time = 0;
         v->ts_last_time = 0;
-        //av_log(NULL, AV_LOG_ERROR, "[debug-hls]DOWNLOAD_START v->cur_seq_no = %d,v->bandwidth = %d; startTime = %lld",
-        //                v->cur_seq_no,v->bandwidth, v->load_time);
+        av_log(NULL, AV_LOG_DEBUG,"%s:need reload,v->cur_seq_no = %d,load_time = %lld",__FUNCTION__,v->cur_seq_no,v->load_time);
 
         //---------------------------------------------检测Discontinuity后重复切片(CNTV)----------------------------------------------//
         AVIOParams *params = c->interrupt_callback->ioparams;
@@ -1305,12 +1489,10 @@ reload:
         last_open_timeUs = av_gettime();
     }
     
-    retry = FFMIN(v->target_duration / 2, 3);
+    retry = FFMAX(v->target_duration / 2, 3);
     int64_t start_time = av_gettime();
     while(retry--){
         ret = ffurl_read(v->input, buf, buf_size);
-        av_usleep(5*1000);
-
         if (ret > 0){
             if(0 == v->ts_first_time){
                  v->ts_first_time = av_gettime();
@@ -1342,7 +1524,7 @@ reload:
         }
 
         if (ret < 0) {
-            check_parse_playlist(v, &reload_interval, parse_list_retry, &ret);
+            check_parse_playlist(v, &reload_interval, &ret);
         }
        
         av_log(NULL,AV_LOG_DEBUG,"read:retry=%d,ret=%d",retry,ret);
@@ -1367,16 +1549,13 @@ reload:
         
         // send download end event
         int64_t endTime = av_gettime();
-        av_log(NULL, AV_LOG_ERROR, "[debug-hls]DOWNLOAD_END   v->cur_seq_no = %d,v->bandwidth = %d, endTime = %lld,startTime = %lld",
-                              v->cur_seq_no,v->bandwidth, endTime,v->load_time);
-        av_log(NULL, AV_LOG_ERROR, "[debug-hls]--");
+        av_log(NULL, AV_LOG_DEBUG, "read_data(), download ts file cur_seq_no = %d,time = %lld,startTime = %lld",v->cur_seq_no,endTime,v->load_time);
         ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_END,(endTime - v->load_time)/1000);
     }
     else
     {
         ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_TIMEOUT, v->cur_seq_no);
         ff_send_message(c->interrupt_callback,MEDIA_INFO_DOWNLOAD_ERROR,TIMEOUT);
-        av_log(NULL, AV_LOG_ERROR, "[debug-hls]DOWNLOAD_TIMEOUT, v->cur_seq_no = %d", v->cur_seq_no);
     }
     v->cur_seq_no++;
 
@@ -1397,17 +1576,24 @@ reload:
                 --index;
             }
 #if HLS_DEBUG
-            //av_log(NULL,AV_LOG_DEBUG,"[debug-hls]bandwidth=%d,c->bandwidth=%d",v->bandwidth,c->bandwidth_info[index]->bandwidth );
+            av_log(NULL,AV_LOG_DEBUG,"bandwidth=%d,c->bandwidth=%d",v->bandwidth,c->bandwidth_info[index]->bandwidth );
 #endif
             if(v->bandwidth != c->bandwidth_info[index]->bandwidth)
             {
-                av_log(NULL,AV_LOG_ERROR,"[debug-hls]index=%d; curBandWidth=%d; newBandWidth=%d",
-                                  index, v->bandwidth, c->bandwidth_info[index]->bandwidth);
+                av_log(NULL,AV_LOG_DEBUG,"final estimateBH(%d)=%d",index,c->bandwidth_info[index]->bandwidth);
                 memcpy(v->url,c->bandwidth_info[index]->url,sizeof(v->url));
                 v->bandwidth = c->bandwidth_info[index]->bandwidth;
                 v->finished = 0;
+                //avoid parse_playlist use redirect url
+                AVIOParams *ioparams = c->interrupt_callback->ioparams;
+                if(ioparams && ioparams->type == 1) {
+                    ioparams->redirect = 0;
+                    ioparams->url[0] = '\0';
+                }
+                
                 // Notify bitrate change for fjcmcc
-                ff_send_message(c->interrupt_callback, MEDIA_INFO_BITRATE_CHANGE, v->bandwidth);
+                //ff_send_message(c->interrupt_callback, MEDIA_INFO_BITRATE_CHANGE, v->bandwidth);
+                ff_check_operate(c->interrupt_callback, OPERATE_SET_BITRATE_CHANGE, v->url, &(v->bandwidth));
 #if HLS_DEBUG                
                 av_log(NULL,AV_LOG_DEBUG,"there is BandChanged,so recompute loadtime");
 #endif
@@ -1690,6 +1876,14 @@ loadplaylist1:
     av_log(NULL,AV_LOG_DEBUG,"HLS header end");
     return 0;
 fail:
+    av_log(NULL,AV_LOG_ERROR,"hls_read_header:failed");
+    if(c->interrupt_callback->ioparams){
+        if(c->interrupt_callback->ioparams->hd){
+            ffurl_closep(&c->interrupt_callback->ioparams->hd);
+        }
+       av_free(c->interrupt_callback->ioparams);
+       c->interrupt_callback->ioparams = NULL;
+    }    
     free_variant_list(c);
     return ret;
 }
@@ -1842,16 +2036,17 @@ start:
 
 static int hls_close(AVFormatContext *s)
 {
-	av_log(NULL, AV_LOG_DEBUG, "Hery, hls_close");
+	av_log(NULL, AV_LOG_ERROR, "hls_close:in");
     HLSContext *c = s->priv_data;
 
     AVIOParams *params = c->interrupt_callback->ioparams;
     if(params) params->willclose = 1;
     
     free_variant_list(c);
-    av_log(NULL,AV_LOG_DEBUG,"hls_close:DestroyQueue");
+    
     if(c->BandWidthqueue != NULL)
     {
+        av_log(NULL,AV_LOG_ERROR,"hls_close:DestroyQueue");
         DestroyQueue(c->BandWidthqueue);
         c->BandWidthqueue = NULL;
     }
@@ -1862,6 +2057,7 @@ static int hls_close(AVFormatContext *s)
        av_free(params);
        c->interrupt_callback->ioparams = NULL;
     }
+    av_log(NULL,AV_LOG_ERROR,"hls_close:ok");
     return 0;
 }
 
@@ -2193,6 +2389,7 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
         var->pb.buf_end = var->pb.buf_ptr = var->pb.buffer;
         /* Reset the pos, to let the mpegts demuxer know we've seeked. */
         var->pb.pos = 0;
+        var->reload_retry_cnt = 0;
 	    av_log(NULL,AV_LOG_DEBUG,"hls_read_seek:pos%f",pos);
 
         av_log(NULL,AV_LOG_DEBUG,"c->seek_flags = %d",c->seek_flags);

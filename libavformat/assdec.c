@@ -25,9 +25,14 @@
 
 #define MAX_LINESIZE 2000
 
+typedef struct ASSEvent{
+    int64_t pts;
+    uint8_t *event;
+}ASSEvent;
+
 typedef struct ASSContext{
     uint8_t *event_buffer;
-    uint8_t **event;
+    ASSEvent *event_ass;
     unsigned int event_count;
     unsigned int event_index;
 }ASSContext;
@@ -48,7 +53,7 @@ static int read_close(AVFormatContext *s)
     ASSContext *ass = s->priv_data;
 
     av_freep(&ass->event_buffer);
-    av_freep(&ass->event);
+    av_freep(&ass->event_ass);
 
     return 0;
 }
@@ -70,8 +75,10 @@ static int64_t get_pts(const uint8_t *p)
 
 static int event_cmp(const void *_a, const void *_b)
 {
-    const uint8_t *const *a = _a, *const *b = _b;
-    return get_pts(*a) - get_pts(*b);
+    struct ASSEvent *a = _a, *b = _b;
+    return a->pts - b->pts;
+    //const uint8_t *const *a = _a, *const *b = _b;
+    //return get_pts(*a) - get_pts(*b);
 }
 
 static int read_header(AVFormatContext *s)
@@ -120,19 +127,20 @@ static int read_header(AVFormatContext *s)
     }
     st->codec->extradata_size= pos[0];
 
-    if(ass->event_count >= UINT_MAX / sizeof(*ass->event))
+    if(ass->event_count >= UINT_MAX / sizeof(struct ASSEvent))
         goto fail;
 
-    ass->event= av_malloc(ass->event_count * sizeof(*ass->event));
+    ass->event_ass = av_malloc(ass->event_count * sizeof(struct ASSEvent));
     p= ass->event_buffer;
     for(i=0; i<ass->event_count; i++){
-        ass->event[i]= p;
+        ass->event_ass[i].pts = get_pts(p);
+        ass->event_ass[i].event = p;
         while(*p && *p != '\n')
             p++;
         p++;
     }
-
-    qsort(ass->event, ass->event_count, sizeof(*ass->event), event_cmp);
+    
+    qsort(ass->event_ass, ass->event_count, sizeof(struct ASSEvent), event_cmp);
 
     return 0;
 
@@ -150,7 +158,7 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
     if(ass->event_index >= ass->event_count)
         return AVERROR_EOF;
 
-    p= ass->event[ ass->event_index ];
+    p= ass->event_ass[ ass->event_index ].event;
 
     end= strchr(p, '\n');
     av_new_packet(pkt, end ? end-p+1 : strlen(p));
@@ -190,7 +198,7 @@ static int read_seek2(AVFormatContext *s, int stream_index,
         }
         /* TODO: ass->event[] is sorted by pts so we could do a binary search */
         for (i=0; i<ass->event_count; i++) {
-            int64_t pts = get_pts(ass->event[i]);
+            int64_t pts = get_pts(ass->event_ass[i].event);
             int64_t ts_diff = FFABS(pts - ts);
             if (pts >= min_ts && pts <= max_ts && ts_diff < min_ts_diff) {
                 min_ts_diff = ts_diff;

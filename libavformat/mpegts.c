@@ -560,7 +560,7 @@ static const StreamType ISO_types[] = {
     { 0x03, AVMEDIA_TYPE_AUDIO,        AV_CODEC_ID_MP3 },
     { 0x04, AVMEDIA_TYPE_AUDIO,        AV_CODEC_ID_MP3 },
  //   { 0x06, AVMEDIA_TYPE_AUDIO,       AV_CODEC_ID_EAC3 },
- //   { 0x0f, AVMEDIA_TYPE_AUDIO,        AV_CODEC_ID_AAC },
+    { 0x0f, AVMEDIA_TYPE_AUDIO,        AV_CODEC_ID_AAC },
     { 0x10, AVMEDIA_TYPE_VIDEO,      AV_CODEC_ID_MPEG4 },
     /* Makito encoder sets stream type 0x11 for AAC,
      * so auto-detect LOAS/LATM instead of hardcoding it. */
@@ -887,6 +887,10 @@ static int mpegts_push_data(MpegTSFilter *filter,
                             return AVERROR(ENOMEM);
                         pes->st->id = pes->pid;
                         mpegts_set_stream_info(pes->st, pes, 0, 0);
+                        if (pes->st->codec->codec_id == AV_CODEC_ID_AAC && !pes->st->request_probe) {
+                            av_log(NULL, AV_LOG_ERROR, "AAC need to probe to detect aac && latm"); // dvb sometimes set stream type acc but is latm 
+                            pes->st->request_probe = 1;
+                        }
                     }
 
                     pes->total_size = AV_RB16(pes->header + 4);
@@ -899,7 +903,7 @@ static int mpegts_push_data(MpegTSFilter *filter,
                     pes->buffer = av_malloc(pes->total_size+FF_INPUT_BUFFER_PADDING_SIZE);
                     if (!pes->buffer)
                         return AVERROR(ENOMEM);
-
+					
                     if (code != 0x1bc && code != 0x1bf && /* program_stream_map, private_stream_2 */
                         code != 0x1f0 && code != 0x1f1 && /* ECM, EMM */
                         code != 0x1ff && code != 0x1f2 && /* program_stream_directory, DSMCC_stream */
@@ -909,6 +913,9 @@ static int mpegts_push_data(MpegTSFilter *filter,
                             av_dlog(pes->stream, "pid=%x stream_type=%x probing\n",
                                     pes->pid, pes->stream_type);
                             pes->st->request_probe= 1;
+                        } else if (pes->st->codec->codec_id == AV_CODEC_ID_AAC && !pes->st->request_probe) {
+                            av_log(NULL, AV_LOG_DEBUG, "AAC need to probe to detect aac && latm");
+                            pes->st->request_probe = 1;
                         }
                     } else {
                         pes->state = MPEGTS_PAYLOAD;

@@ -778,6 +778,40 @@ no_packet:
                 || st->probe_packets<=0;
 
         if(end || av_log2(pd->buf_size) != av_log2(pd->buf_size - pkt->size)){
+            if (st->codec->codec_id == AV_CODEC_ID_AAC) {
+                av_log(s, AV_LOG_ERROR, "AAC probe_codec aac & loas(aac_latm)");
+                AVInputFormat *fmt1 = NULL, *fmt = NULL;
+                int score_max = 0;
+                while ((fmt1 = av_iformat_next(fmt1))) {
+                    if (strcmp(fmt1->name, "aac") && strcmp(fmt1->name, "loas"))
+                        continue;
+                    int score = 0;
+                    if (fmt1->read_probe) {
+                        score = fmt1->read_probe(pd);
+                    }
+                    if (score > score_max) {
+                        score_max = score;
+                        fmt = fmt1;
+                    } else if (score == score_max) {
+                        fmt = NULL;
+                    }
+                    av_log(s, AV_LOG_ERROR, "AAC probe_codec fmt: %s", fmt1->name);
+                    av_log(s, AV_LOG_ERROR, "AAC probe_codec score: %d", score);
+                }
+                if (fmt) {
+                    if (!strcmp(fmt->name, "aac"))
+                        st->codec->codec_id = AV_CODEC_ID_AAC;
+                    else {
+                        st->codec->codec_id = AV_CODEC_ID_AAC_LATM;
+                        av_log(s, AV_LOG_ERROR, "AAC set stream codec AV_CODEC_ID_AAC_LATM");
+                    }
+                }
+                pd->buf_size=0;
+                av_freep(&pd->buf);
+                st->request_probe = -1;
+                return;
+            }
+
             int score= set_codec_from_probe_data(s, st, pd);
             if(    (st->codec->codec_id != AV_CODEC_ID_NONE && score > AVPROBE_SCORE_RETRY)
                 || end){
@@ -3631,11 +3665,14 @@ tryAgain:
         AVStream* video_st = NULL;
 
         int video_track_cnt = 0;
+        int audio_track_cnt = 0;
         for(i=0; i<ic->nb_streams; i++) {
             st = ic->streams[i];
-            if(st->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
+            if(st->codec->codec_type == AVMEDIA_TYPE_VIDEO && !(st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
                 video_track_cnt++;
-            }
+            } else if (st->codec->codec_type == AVMEDIA_TYPE_AUDIO) {
+                audio_track_cnt++;
+			}
         }
 
         int strm_find_cnt = 0;
@@ -3673,7 +3710,8 @@ tryAgain:
             }
         }
 
-        if (video_find == 1 && (ic->mIPTVControlProbe == 1 || ic->mIPTVControlProbe == 2)) {
+        if (video_find == 1 && ((ic->mIPTVControlProbe == 1 || ic->mIPTVControlProbe == 2) || 
+			(video_track_cnt == 1 && audio_track_cnt == 1 && ic->nb_streams == 2 && (strncmp(ic->filename, "file/fd::", 9) != 0)))) {
             int64_t t = 0;
             if (st->codec_info_nb_frames > 1 && st->info) {
                 if (st->time_base.den > 0)
@@ -4063,7 +4101,13 @@ tryAgain:
     }
     
     if(ic->probesize && !(ic->mIPTVControlProbe == 1 || ic->mIPTVControlProbe == 2)) {
-        estimate_timings(ic, old_offset);
+        int has_duration = 0;
+        ff_check_operate(&ic->interrupt_callback, OPERATE_GET_HAVE_DURATION, &has_duration, NULL);
+        if (has_duration) {
+            av_log(NULL, AV_LOG_ERROR, "%s: has duration from url: %0.2f",__FUNCTION__, ic->duration);
+        } else {
+            estimate_timings(ic, old_offset);
+        }
     } else{
         if (has_h264_codec && !has_except_h264_codec) {
             //keep pktbuf, so can't flush. and tsplayer can't reset bufferindex to 0

@@ -271,4 +271,7 @@ static inline void *av_x_if_null(const void *p, const void *x)
 #define OPERATE_SET_MOV_SEEK_ANY 8
 #define OPERATE_GET_NETWORK_RECONNECT 9
 #define OPERATE_SET_STREAM_INFO 100
+#define OPERATE_SET_BITRATE_CHANGE 101
+#define OPERATE_GET_HAVE_DURATION 102
+
 #endif /* AVUTIL_AVUTIL_H */
